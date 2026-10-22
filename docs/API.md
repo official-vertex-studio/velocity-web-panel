@@ -170,26 +170,3 @@ All SDKs call the same language-neutral REST routes; there is no separate API im
 
 API keys are read-only. A request using an API key to a write endpoint must not be used for player actions, routing changes, maintenance changes, account management, or configuration updates.
 
-## Python Discord bot (`discord.py`) walkthrough
-
-The complete sample is `examples/python/discord_bot.py`; it registers `/minecraft` and `/minecraft_players`. It uses `examples/python/vertex_client.py`.
-
-1. Create a read-only API key in the panel's **API & Integrations** page. Copy it once and keep it private.
-2. Install Python 3.10 or newer and run `python -m pip install -U discord.py requests`.
-3. In the Discord Developer Portal, create a bot and invite it with the `bot` and `applications.commands` scopes. Keep the bot token private.
-4. Set environment variables on the machine/container that runs the bot:
-
-```bash
-# Linux / Pterodactyl startup environment
-export DISCORD_TOKEN='your-discord-bot-token'
-export VERTEX_URL='https://panel.example.com'
-export VERTEX_API_KEY='vv_live_your_read_only_key'
-python examples/python/discord_bot.py
-```
-
-On Windows PowerShell, use `$env:DISCORD_TOKEN='...'`, `$env:VERTEX_URL='https://panel.example.com'`, and `$env:VERTEX_API_KEY='...'`, then run `python examples/python/discord_bot.py`. Set these as panel/container environment variables in production rather than committing them to a file. `VERTEX_URL` is the panel origin only; the SDK adds `/api/v1` itself. Use HTTPS for remote access.
-
-5. Once the bot logs in and syncs slash commands, run `/minecraft` for an overview or `/minecraft_players` to privately view the online player list. The example defers its interaction before making HTTP requests so Discord's response deadline is respected.
-6. If commands do not appear, check that the bot was invited with `applications.commands`, that the bot is online, and that command sync succeeded. If the API returns HTTP 401, create a new key or verify the environment variables; if it returns HTTP 403, ensure the key is being used only for supported read-only routes.
-
-The sample intentionally sends generic errors to Discord so it does not disclose API keys, raw headers, or private panel details. Check server-side bot logs when troubleshooting, but do not log the key.

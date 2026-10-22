@@ -28,17 +28,3 @@ The REST API is shared across all supported languages. Set `VERTEX_URL` to the p
 - Kotlin: `examples/kotlin/VertexApiExample.kt`
 
 Each language uses standard HTTPS requests with `Authorization: Bearer ...`. In languages where the example is intentionally minimal, use the same request helper pattern and change the path/query to call any route listed above. API keys are read-only and cannot perform administrative mutations.
-
-## Python Discord bot setup
-
-See the step-by-step guide in `docs/API.md` under **Python Discord bot walkthrough**. Short version:
-
-```bash
-python -m pip install -U discord.py requests
-export DISCORD_TOKEN='...'
-export VERTEX_URL='https://panel.example.com'
-export VERTEX_API_KEY='vv_live_...'
-python examples/python/discord_bot.py
-```
-
-Use PowerShell `$env:NAME='value'` syntax on Windows. Never commit tokens or API keys to Git.
