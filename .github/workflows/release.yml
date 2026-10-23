@@ -5,7 +5,6 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -26,13 +25,44 @@ jobs:
           java-version: "25"
           cache: maven
 
-      - name: Build and verify
-        run: mvn --batch-mode --no-transfer-progress clean verify
-
-      - name: Publish GitHub Release with JAR
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify version and build
+        shell: bash
         run: |
-          gh release create "${GITHUB_REF_NAME}" target/*.jar \
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          POM_VERSION="$(mvn -q -DforceStdout help:evaluate -Dexpression=project.version)"
+
+          echo "Release tag version: $TAG_VERSION"
+          echo "Maven project version: $POM_VERSION"
+
+          if [ "$TAG_VERSION" != "$POM_VERSION" ]; then
+            echo "::error::The release tag and pom.xml versions do not match."
+            exit 1
+          fi
+
+          mvn --batch-mode --no-transfer-progress clean verify
+
+      - name: Check release JAR
+        shell: bash
+        run: |
+          JAR="target/vertex-velocity-web-panel-${GITHUB_REF_NAME#v}.jar"
+
+          if [ ! -f "$JAR" ]; then
+            echo "::error::Expected JAR not found: $JAR"
+            echo "Files found in target/:"
+            ls -la target/
+            exit 1
+          fi
+
+          echo "JAR ready for release: $JAR"
+          sha256sum "$JAR"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          JAR="target/vertex-velocity-web-panel-${GITHUB_REF_NAME#v}.jar"
+
+          gh release create "$GITHUB_REF_NAME" "$JAR" \
             --title "Vertex Velocity Web Panel ${GITHUB_REF_NAME}" \
             --generate-notes
