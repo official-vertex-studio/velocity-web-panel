@@ -15,7 +15,6 @@
 - [In-game commands](#in-game-commands)
 - [REST API](#rest-api)
 - [API authentication and key management](#api-authentication-and-key-management)
-- [Integrate a Python Discord bot](#integrate-a-python-discord-bot)
 - [Language examples / SDKs](#language-examples--sdks)
 - [Security model](#security-model)
 - [Data, analytics and monitoring limitations](#data-analytics-and-monitoring-limitations)
@@ -365,66 +364,6 @@ Never:
 
 For a private local test, `VERTEX_URL=http://127.0.0.1:25569` can be appropriate. For remote access, configure HTTPS and use a real certificate.
 
-## Integrate a Python Discord bot
-
-A complete `discord.py` example is included in [`examples/python/discord_bot.py`](examples/python/discord_bot.py). It uses [`examples/python/vertex_client.py`](examples/python/vertex_client.py) and registers `/minecraft` and `/minecraft_players`.
-
-### 1. Create a read-only API key
-
-In the panel, sign in as the owner → **API & Integrations** → create a key such as `Discord bot`. Copy it once and keep it private.
-
-### 2. Create the Discord application
-
-1. Open the [Discord Developer Portal](https://discord.com/developers/applications).
-2. Create an application and add a bot.
-3. Invite it to your Discord server with the `bot` and `applications.commands` OAuth scopes.
-4. Keep the Discord bot token secret. Do not use the Minecraft server token or panel password here.
-
-### 3. Install dependencies
-
-Use Python 3.10 or newer:
-
-```bash
-python -m pip install -U discord.py requests
-```
-
-### 4. Set environment variables
-
-Linux/macOS shell:
-
-```bash
-export DISCORD_TOKEN='your-discord-bot-token'
-export VERTEX_URL='https://panel.example.com'
-export VERTEX_API_KEY='vv_live_your_read_only_key'
-python examples/python/discord_bot.py
-```
-
-Windows PowerShell:
-
-```powershell
-$env:DISCORD_TOKEN = 'your-discord-bot-token'
-$env:VERTEX_URL = 'https://panel.example.com'
-$env:VERTEX_API_KEY = 'vv_live_your_read_only_key'
-python examples/python/discord_bot.py
-```
-
-`VERTEX_URL` is the panel origin, not the full `/api/v1` path. The client adds `/api/v1` itself. On Pterodactyl, set the variables in the bot server's environment/startup configuration instead of hardcoding them in the script. The bot and proxy can run in different containers as long as the bot can reach the panel over the configured network.
-
-### 5. Use the slash commands
-
-- `/minecraft` displays total connected players, registered backends and each backend's ping status/player count.
-- `/minecraft_players` privately displays online player names, current backend and ping. You can optionally pass a backend filter.
-
-If the slash commands do not appear, confirm the bot is online, the `applications.commands` scope was used, and the bot log says command synchronization succeeded. Global Discord command propagation can take time.
-
-### 6. Understand errors
-
-- `401`: the key is missing, incorrect, revoked or the URL points at the wrong panel.
-- `403`: an API key is trying to use a write route, or the current web account lacks permission.
-- `404`: the requested resource or route does not exist, or the player/backend is unknown.
-- `5xx` / connection timeout: check the panel process, bind address, Pterodactyl allocation, firewall, TLS certificate and proxy logs.
-
-The sample sends generic failures to Discord to avoid leaking API credentials or internal details. Inspect the bot's local logs for troubleshooting, but never log the key or full authorization header.
 
 ## Language examples / SDKs
 
