@@ -1,0 +1,63 @@
+name: Bug report
+description: Report a reproducible problem in Vertex Velocity Web Panel.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search existing issues first. Never include passwords, API keys, access tokens, or other secrets.
+  - type: input
+    id: version
+    attributes:
+      label: Plugin version
+      description: Include the release version or Git commit.
+      placeholder: "e.g. 0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: velocity
+    attributes:
+      label: Velocity version
+      placeholder: "e.g. version shown in the proxy startup log"
+    validations:
+      required: true
+  - type: input
+    id: java
+    attributes:
+      label: Java version
+      placeholder: "e.g. output of java -version"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem clearly.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Configure ...
+        2. Start the proxy ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      description: Remove secrets and personal data before posting.
+      render: text
+    validations:
+      required: false
