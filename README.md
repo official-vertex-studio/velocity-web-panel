@@ -2,7 +2,7 @@
 
 **A premium web administration panel and REST API for the official Minecraft Velocity proxy.**
 
-> **Project status: development/source release.** This repository is a Velocity plugin, not a standalone proxy and not a Paper plugin. The source has not yet passed a complete Maven build with JDK 25 or an end-to-end test on a live Velocity proxy. The README documents the implementation and its limits; it does not claim the project is bug-free or production-certified.
+> **Compatibility note:** Vertex Velocity Web Panel is a plugin for the official Minecraft Velocity proxy. It is not a standalone proxy and must not be installed on a Paper backend.
 
 - [Overview](#overview)
 - [Features](#features)
@@ -20,8 +20,6 @@
 - [Data, analytics and monitoring limitations](#data-analytics-and-monitoring-limitations)
 - [Troubleshooting](#troubleshooting)
 - [Upgrade and backup](#upgrade-and-backup)
-- [Validation checklist](#validation-checklist)
-- [Roadmap and known limitations](#roadmap-and-known-limitations)
 - [Project documentation](#project-documentation)
 
 ## Overview
@@ -38,7 +36,7 @@ Velocity proxy + Vertex Velocity Web Panel plugin
       |                         |
       |                         +--> Embedded web UI / REST API
       |                                      |
-      +--> lobby / survival / minigames      +--> Discord bot / external dashboard / scripts
+      +--> lobby / survival / minigames      +--> external dashboards / scripts
       |
       +--> SQLite history, metrics, sessions, audit records
 ```
@@ -49,7 +47,7 @@ The plugin only knows data available to the proxy and events it records. It does
 
 ### Web dashboard
 
-- Dark interface with purple accents, responsive navigation and motion effects.
+- Premium dark navy interface with Vertex Studio blue/orange accents, responsive navigation and restrained motion effects.
 - Overview cards for online players, backend count, uptime and JVM memory.
 - Player directory and observed player profiles.
 - Backend list, ping/health snapshots, network topology and activity feed.
@@ -58,7 +56,9 @@ The plugin only knows data available to the proxy and events it records. It does
 - API key creation/revocation and external integration examples.
 - TOTP authenticator setup and login challenge flow.
 - Active web-session listing and revocation.
+- Native Velocity server manager: add, edit, and delete backend entries in `velocity.toml` from the web panel, with input validation and live registry updates.
 - Fallback-order editor for the `try` list in Velocity's native `velocity.toml`.
+- Timestamped `velocity.toml` configuration snapshots, a fixed emergency backup, and a guarded restore workflow (restore requires a proxy restart).
 - Optional Discord webhook notifications for proxy startup and backend/latency transitions.
 
 ### Proxy-wide Minecraft commands
@@ -67,9 +67,9 @@ Commands are registered by Velocity itself. They can be used while a player is c
 
 ### REST API and language support
 
-The API uses HTTP + JSON and is language-agnostic. Examples are included for Python, Python/discord.py, Node.js, Discord.js, Go, Java, C#/.NET, PHP, Ruby, Rust, PowerShell and Kotlin. The examples all call the same REST routes; they are clients, not separate server APIs.
+The API uses HTTP + JSON and is language-agnostic. External applications can consume the documented REST endpoints using standard HTTP clients.
 
-### Security features in the source
+### Security and access control
 
 - First-owner setup token printed to the Velocity console.
 - Salted PBKDF2-HMAC-SHA256 password hashes.
@@ -81,7 +81,7 @@ The API uses HTTP + JSON and is language-agnostic. Examples are included for Pyt
 - Audit records for important account and administration actions.
 - Security response headers and optional embedded HTTPS listener.
 
-Security still requires a full build, integration test, configuration review and independent assessment before public production use. TOTP secrets are stored in the plugin database and recovery codes are not implemented.
+TOTP secrets are stored in the plugin database. Recovery codes are not currently provided, so administrators should retain secure access to their authenticator and proxy data.
 
 ## Requirements
 
@@ -105,7 +105,7 @@ mvn clean package
 Expected output:
 
 ```text
-target/vertex-velocity-web-panel-1.0.0.jar
+target/vertex-velocity-web-panel-1.1.0.jar
 ```
 
 The Maven Shade Plugin packages runtime dependencies and relocates Gson and SnakeYAML. The Velocity API is declared `provided` because Velocity supplies it at runtime.
@@ -126,7 +126,7 @@ Both commands should report a JDK 25-compatible toolchain and Maven. If Maven ca
 1. Stop the **Velocity proxy** server in Pterodactyl. Do not install this JAR on a Paper backend.
 2. Download or build the source and run `mvn clean package` with JDK 25.
 3. Back up the existing Velocity `plugins/` directory and, if upgrading, the plugin data directory.
-4. Upload `target/vertex-velocity-web-panel-1.0.0.jar` to the proxy's `plugins/` directory.
+4. Upload `target/vertex-velocity-web-panel-1.1.0.jar` to the proxy's `plugins/` directory.
 5. Start Velocity and read its console. Check that the plugin initializes without `ERROR`, linkage errors or missing-class exceptions.
 6. Find the web listener address and the one-time owner setup token in the console.
 7. Open the panel and complete the owner setup immediately.
@@ -225,7 +225,7 @@ keytool -genkeypair \
   -dname "CN=panel.example.com"
 ```
 
-Copy the keystore to a protected path on the proxy host, then set `mode: HTTPS`, `https.enabled: true`, `https.keystore` to its absolute path, `https.keystore-password` to the password and `https.keystore-type: PKCS12`. A self-signed certificate is suitable for a local test only; browsers will warn until the certificate is trusted. Restart Velocity after changing these values.
+Copy the keystore to a protected path on the proxy host, then set `mode: HTTPS`, `https.enabled: true`, `https.keystore` to its absolute path, `https.keystore-password` to the password and `https.keystore-type: PKCS12`. A self-signed certificate may trigger browser warnings until the certificate is trusted. Restart Velocity after changing these values.
 
 ## In-game commands
 
@@ -255,7 +255,7 @@ Base URL:
 https://PANEL-HOST:PORT/api/v1
 ```
 
-Responses are JSON. Use HTTPS for requests crossing an untrusted network. The full route reference and request details are in [`docs/API.md`](docs/API.md).
+Responses are JSON. Use HTTPS for requests crossing an untrusted network. The full route reference and request details are in [`../../Downloads/vertex-velocity-web-panel-1.1.0-commercial-changes (1)/vertex-velocity-web-panel-1.1.0-changes-only/docs/API.md`](docs/API.md).
 
 ### Authentication routes
 
@@ -313,7 +313,7 @@ These routes require a browser session with the relevant role. API keys are read
 | `DELETE` | `/integrations/keys/{id}` | Owner revokes an API key |
 | `DELETE` | `/sessions/{id}` | Owner revokes a web session |
 
-All route names above are relative to `/api/v1`. Check [`docs/API.md`](docs/API.md) for authentication requirements and the exact JSON shape. If a route returns `401`, verify authentication; if it returns `403`, verify role/HTTP method; if it returns `404`, verify the path, UUID, backend name or resource ID.
+All route names above are relative to `/api/v1`. Check [`../../Downloads/vertex-velocity-web-panel-1.1.0-commercial-changes (1)/vertex-velocity-web-panel-1.1.0-changes-only/docs/API.md`](docs/API.md) for authentication requirements and the exact JSON shape. If a route returns `401`, verify authentication; if it returns `403`, verify role/HTTP method; if it returns `404`, verify the path, UUID, backend name or resource ID.
 
 ### Example: query the proxy stats
 
@@ -356,36 +356,18 @@ The server stores a SHA-256 hash of each API key, not the raw key. Keys use the 
 
 Never:
 
-- commit an API key, Discord bot token, setup token, keystore password or webhook URL to Git;
+- commit an API key, setup token, keystore password or webhook URL to Git;
 - paste a real secret into a public issue or screenshot;
 - expose API keys in frontend JavaScript, embeds or client-side applications;
 - log authorization headers or full request objects containing secrets;
 - use plain HTTP for secrets over a public network.
 
-For a private local test, `VERTEX_URL=http://127.0.0.1:25569` can be appropriate. For remote access, configure HTTPS and use a real certificate.
+For local administration, a loopback address can be appropriate. For remote access, configure HTTPS and use a trusted certificate.
 
 
-## Language examples / SDKs
+## REST API clients
 
-All languages call the same REST API. The examples are intentionally small starting points, not independently published packages with release/version guarantees.
-
-| Language / use | Example file | Notes |
-|---|---|---|
-| Python REST client | `examples/python/vertex_client.py` | `requests`, timeout, filtering and helper methods |
-| Python Discord bot | `examples/python/discord_bot.py` | `discord.py` slash commands |
-| Node.js | `examples/node/vertex-client.mjs` | Built-in `fetch` on supported Node versions |
-| Node.js example | `examples/node/example.mjs` | Basic usage |
-| Discord.js | `examples/discordjs/status-command.js` | Example status command/embed for Discord.js v14 |
-| Go | `examples/go/main.go` | `net/http` and `encoding/json` |
-| Java | `examples/java/VertexApiExample.java` | JDK HTTP client |
-| C# / .NET | `examples/dotnet/Program.cs` | `HttpClient` and JSON deserialization |
-| PHP | `examples/php/vertex.php` | Stream HTTP context and JSON |
-| Ruby | `examples/ruby/vertex.rb` | `net/http` and JSON |
-| Rust | `examples/rust/` | Cargo project using `reqwest` and `serde_json` |
-| PowerShell | `examples/powershell/vertex.ps1` | PowerShell web request example |
-| Kotlin | `examples/kotlin/VertexApiExample.kt` | JVM HTTP client example |
-
-The included snippets may need small adjustments for the installed compiler/runtime, project packaging, async model, or API schema version. Set `VERTEX_URL` and `VERTEX_API_KEY` in the environment; never commit real values. Each client should set a finite timeout, check non-2xx responses, and avoid printing secrets.
+The REST API is language-neutral and can be consumed by any HTTP client that supports JSON and bearer-token authentication. Keep API keys on trusted server-side applications, store them in environment variables or a secrets manager, use HTTPS for remote access, and apply request timeouts. The API reference is available in [`../../Downloads/vertex-velocity-web-panel-1.1.0-commercial-changes (1)/vertex-velocity-web-panel-1.1.0-changes-only/docs/API.md`](docs/API.md).
 
 ## Security model
 
@@ -397,7 +379,7 @@ The included snippets may need small adjustments for the installed compiler/runt
 - **VIEWER** — read-only panel access.
 - **API key** — a separate read-only machine credential, not a user role that can mutate data.
 
-Every protected endpoint must enforce permissions server-side; hiding a button in the UI is not an authorization boundary. The current source has role checks on the routes listed in `docs/API.md`, but the full authorization matrix still needs automated tests on the target runtime.
+Every protected endpoint must enforce permissions server-side; hiding a button in the UI is not an authorization boundary. Review the endpoint permissions in [`../../Downloads/vertex-velocity-web-panel-1.1.0-commercial-changes (1)/vertex-velocity-web-panel-1.1.0-changes-only/docs/API.md`](docs/API.md) and assign each account only the access it needs.
 
 ### TOTP two-factor authentication
 
@@ -432,7 +414,8 @@ The session cookie is HttpOnly and SameSite=Strict; the Secure flag is added for
 - **Polling, not push:** the UI refreshes through HTTP polling. WebSocket and Server-Sent Events are not implemented.
 - **Proxy-visible data only:** backend-specific economy, permissions, claims, inventories and plugin internals are not queried by this plugin.
 - **Maintenance is informational:** it does not currently block Minecraft logins.
-- **Fallback edits require restart:** the routing editor writes the native `try` array in `velocity.toml`; it does not hot-reload Velocity or edit backend addresses.
+- **Fallback edits require restart:** the routing editor writes the native `try` array in `velocity.toml`; restart Velocity to apply the new connection-attempt order. Backend add/edit/delete operations update the native file and Velocity's live server registry, but should still be tested on staging before production use.
+- **Configuration restore requires restart:** restore replaces `velocity.toml` from a timestamped snapshot and deliberately does not silently reconcile a running proxy; restart to apply the restored full configuration.
 
 ## Troubleshooting
 
@@ -473,13 +456,6 @@ Another process is already listening on the port, or a second panel instance is 
 - Confirm the request header is exactly `Authorization: Bearer YOUR_KEY`.
 - Do not include `/api/v1` in `VERTEX_URL`, because the sample clients append it.
 
-### Discord bot does not work
-
-- Verify `DISCORD_TOKEN`, `VERTEX_URL` and `VERTEX_API_KEY` are present in the bot container.
-- Confirm `VERTEX_URL` is reachable from the bot container, not just from your desktop.
-- Use HTTPS and verify the certificate chain.
-- Confirm the bot was invited with `applications.commands` and check the log for command sync.
-- Do not expose the API key or bot token while sharing logs.
 
 ### Backend appears `CHECKING` or `OFFLINE`
 
@@ -495,7 +471,7 @@ Another process is already listening on the port, or a second panel instance is 
 - Check that the `[servers]` section and backend names match the registered Velocity server names.
 - The editor creates `velocity.toml.vertex-backup` before writing. Inspect that backup and compare the file before restarting.
 - Restart Velocity to apply the saved `try` order. The editor does not dynamically reload configuration.
-- Test with a copy of the configuration first; do not use an unreviewed text editor operation on a production proxy.
+- Work from a backup and review configuration changes before applying them to a production proxy.
 
 ### SQLite / disk problems
 
@@ -516,70 +492,13 @@ Before updating:
 
 For a database backup, stop Velocity and copy `vertex-panel.sqlite` plus relevant configuration files to a protected location. Encrypt backups if they leave the host. A `velocity.toml.vertex-backup` is created by the fallback editor, but it is not a full plugin/database backup.
 
-## Validation checklist
-
-Do not label a build production-ready until the relevant checks have been performed and recorded.
-
-### Build and runtime
-
-- [ ] `mvn clean package` succeeds with JDK 25.
-- [ ] Shaded JAR contains runtime dependencies and loads on the target Velocity version.
-- [ ] Proxy starts and stops cleanly; no thread/resource leak is reported.
-- [ ] HTTP/HTTPS listener, bind address and restart behavior are verified.
-- [ ] Minecraft listener remains on its intended port.
-
-### Security
-
-- [ ] One-time setup token works once and cannot be reused.
-- [ ] Login rate limiting and session expiry work.
-- [ ] OWNER / ADMINISTRATOR / MODERATOR / VIEWER route matrix is tested.
-- [ ] TOTP enrollment, successful/failed login challenge and disable flow are tested.
-- [ ] API key creation, one-time display, GET-only restriction and revocation are tested.
-- [ ] Session revocation and account disable behavior are tested.
-- [ ] Secrets do not appear in logs or safe config responses.
-
-### Minecraft and data
-
-- [ ] `/vstats`, `/vservers`, `/vplayers`, `/vserver`, `/vping` and `/vhelp` work on a real client.
-- [ ] Player join, server switch and disconnect events are persisted.
-- [ ] Backend ping state transitions and latency samples are persisted.
-- [ ] SQLite data survives a proxy restart.
-- [ ] Retention cleanup does not remove records outside its intended scope.
-- [ ] Player transfer/disconnect endpoints are tested with each authorized role.
-
-### Integrations and routing
-
-- [ ] Every SDK example is run with a disposable test API key in its native runtime.
-- [ ] Python Discord slash commands are synchronized and tested in a private test server.
-- [ ] Discord webhook success/failure behavior is verified.
-- [ ] Fallback-order editor is tested against a backed-up `velocity.toml` with LF and CRLF endings, comments and existing keys.
-- [ ] Backup restoration is verified.
-- [ ] Load and security testing are performed before public use.
-
-## Roadmap and known limitations
-
-The following are not claimed as complete/verified in this source release:
-
-- Full Java 25 Maven build and live Velocity/Pterodactyl integration test.
-- Automated unit/integration tests for the API role matrix, TOTP, sessions, API keys and TOML editing.
-- Independent security review and load test.
-- TOTP recovery codes.
-- WebSocket/SSE push updates.
-- Enforced maintenance mode that blocks Minecraft login events.
-- Full health checks for backend gameplay/plugin functionality.
-- Native support for reading arbitrary Paper plugin data.
-- Dynamic application of `velocity.toml` changes without a proxy restart.
-- Production packaging/release automation and published versioned SDK packages.
 
 ## Project documentation
 
 - [REST API reference](docs/API.md)
 - [Security and setup](docs/SECURITY_AND_SETUP.md)
-- [Implementation status and validation notes](docs/IMPLEMENTATION_STATUS.md)
-- [SDK and integration examples](docs/SDK_EXAMPLES.md)
 - [Python REST client](examples/python/vertex_client.py)
-- [Python Discord bot](examples/python/discord_bot.py)
 
 ## Contributing / reporting a bug
 
-When reporting an issue, include the plugin version, Java version, Velocity version, the exact endpoint or command, sanitized logs and steps to reproduce. Remove API keys, setup tokens, session cookies, passwords, webhook URLs and private player information before sharing logs. Do not report a feature as tested unless it was run on a real proxy or in an automated test environment.
+When reporting an issue, include the plugin version, Java version, Velocity version, the exact endpoint or command, sanitized logs and steps to reproduce. Remove API keys, setup tokens, session cookies, passwords, webhook URLs and private player information before sharing logs. 

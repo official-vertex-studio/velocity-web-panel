@@ -51,6 +51,12 @@ Revokes a key. The next request using it will fail authentication. A key cannot 
 | GET | `/players/{uuid}?limit=100` | Player profile, estimated playtime, observed sessions, visited backends and recent history |
 | GET | `/servers` | Registered backends, connected players, ping status and latency |
 | GET | `/servers/{name}` | Detailed backend status and its connected players |
+| GET | `/servers/config` | Read configured backend entries from the proxy-root `velocity.toml` |
+| POST | `/servers` | OWNER; add a backend to `velocity.toml` and register it in the live proxy. JSON: `name`, `host`, `port` |
+| PUT | `/servers/{name}` | OWNER; update a backend entry and live registry. JSON: `name`, `host`, `port`; refuses edits while players are connected |
+| DELETE | `/servers/{name}` | OWNER; remove a backend entry and live registry; refuses removal while players are connected or when it would remove the only fallback |
+| GET | `/velocity-config/backups` | List up to 20 timestamped `velocity.toml` snapshots |
+| POST | `/velocity-config/backups/restore` | OWNER; JSON `filename`; restores a snapshot to disk and requires a proxy restart |
 | GET | `/commands` | Proxy-wide in-game commands and their permission nodes |
 | GET | `/network` | Proxy/backend topology snapshot and recent transfer-event summary |
 | GET | `/activity?limit=250` | Retained event history for the activity center |
@@ -75,7 +81,11 @@ Revokes a key. The next request using it will fail authentication. A key cannot 
 | POST | `/2fa/setup` | Current session; create a pending TOTP secret |
 | POST | `/2fa/enable` | Current session; confirm TOTP secret with a six-digit code |
 | POST | `/2fa/disable` | Current session; requires account password and current TOTP code |
-| PUT | `/routing` | OWNER; updates the native Velocity `try` fallback array and creates `velocity.toml.vertex-backup` |
+| PUT | `/routing` | OWNER; updates the native Velocity `try` fallback array, creates backups and requires a proxy restart to apply |
+| POST | `/servers` | OWNER; add backend in native config and live registry |
+| PUT | `/servers/{name}` | OWNER; update backend config and live registry; no connected players allowed |
+| DELETE | `/servers/{name}` | OWNER; remove backend config and live registry; no connected players or last-fallback removal allowed |
+| POST | `/velocity-config/backups/restore` | OWNER; restore a timestamped Velocity config snapshot; proxy restart required |
 | GET/POST | `/users` | OWNER |
 | POST | `/users/{username}` | OWNER; disable/enable account |
 | PUT | `/maintenance` | OWNER, ADMINISTRATOR; informational only |
@@ -84,7 +94,7 @@ Revokes a key. The next request using it will fail authentication. A key cannot 
 
 Enable TOTP from **Security Center**. The panel shows a Base32 secret for manual entry in an authenticator app; confirm it with a valid code before TOTP becomes mandatory at the next login. Disabling TOTP requires the current password and code. Keep access to your authenticator and secure the plugin SQLite database because it stores the TOTP secret.
 
-The routing page edits only the `try` array in the `[servers]` section of `velocity.toml`. The first item becomes the preferred initial/fallback server. It writes a `velocity.toml.vertex-backup` copy before saving. Restart Velocity to apply changes. Verify the path and backup before using this feature on a production proxy. It does not alter backend addresses.
+The Servers page can add, edit, and delete backend entries in the `[servers]` section of the proxy-root `velocity.toml`. The operation validates names, host and port; preserves unrelated text; creates `velocity.toml.vertex-backup` plus timestamped snapshots; and updates Velocity's live server registry. Editing/deleting a backend is refused while it has connected players. Deletion is also refused if it would remove the only fallback entry. Test these operations on a staging proxy before production use. The routing editor changes only the `try` array; restart Velocity to apply routing-order changes. Restoring a whole-file snapshot also requires a restart.
 
 ## Examples
 
@@ -170,3 +180,26 @@ All SDKs call the same language-neutral REST routes; there is no separate API im
 
 API keys are read-only. A request using an API key to a write endpoint must not be used for player actions, routing changes, maintenance changes, account management, or configuration updates.
 
+## Python Discord bot (`discord.py`) walkthrough
+
+The complete sample is `examples/python/discord_bot.py`; it registers `/minecraft` and `/minecraft_players`. It uses `examples/python/vertex_client.py`.
+
+1. Create a read-only API key in the panel's **API & Integrations** page. Copy it once and keep it private.
+2. Install Python 3.10 or newer and run `python -m pip install -U discord.py requests`.
+3. In the Discord Developer Portal, create a bot and invite it with the `bot` and `applications.commands` scopes. Keep the bot token private.
+4. Set environment variables on the machine/container that runs the bot:
+
+```bash
+# Linux / Pterodactyl startup environment
+export DISCORD_TOKEN='your-discord-bot-token'
+export VERTEX_URL='https://panel.example.com'
+export VERTEX_API_KEY='vv_live_your_read_only_key'
+python examples/python/discord_bot.py
+```
+
+On Windows PowerShell, use `$env:DISCORD_TOKEN='...'`, `$env:VERTEX_URL='https://panel.example.com'`, and `$env:VERTEX_API_KEY='...'`, then run `python examples/python/discord_bot.py`. Set these as panel/container environment variables in production rather than committing them to a file. `VERTEX_URL` is the panel origin only; the SDK adds `/api/v1` itself. Use HTTPS for remote access.
+
+5. Once the bot logs in and syncs slash commands, run `/minecraft` for an overview or `/minecraft_players` to privately view the online player list. The example defers its interaction before making HTTP requests so Discord's response deadline is respected.
+6. If commands do not appear, check that the bot was invited with `applications.commands`, that the bot is online, and that command sync succeeded. If the API returns HTTP 401, create a new key or verify the environment variables; if it returns HTTP 403, ensure the key is being used only for supported read-only routes.
+
+The sample intentionally sends generic errors to Discord so it does not disclose API keys, raw headers, or private panel details. Check server-side bot logs when troubleshooting, but do not log the key.

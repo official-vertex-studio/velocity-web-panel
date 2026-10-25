@@ -5,6 +5,7 @@ import com.google.gson.GsonBuilder;
 import com.sun.net.httpserver.*;
 import com.velocitypowered.api.proxy.*;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
+import com.velocitypowered.api.proxy.server.ServerInfo;
 import net.kyori.adventure.text.Component;
 import org.slf4j.Logger;
 import fr.vertexvelocity.webpanel.config.PanelConfig;
@@ -79,7 +80,7 @@ public final class WebPanelServer {
             addSecurityHeaders(x); String path=x.getRequestURI().getPath(); String method=x.getRequestMethod().toUpperCase(Locale.ROOT);
             if(path.equals("/")||path.equals("/index.html")){serveResource(x,"/web/index.html","text/html; charset=utf-8");return;}
             if(path.startsWith("/assets/")){serveResource(x,"/web"+path,"text/plain; charset=utf-8");return;}
-            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","1.0.0","timestamp",Instant.now().getEpochSecond()));return;}
+            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","1.1.0","timestamp",Instant.now().getEpochSecond()));return;}
             if(path.equals("/api/v1/setup-status")&&method.equals("GET")){json(x,200,Map.of("needsSetup",db.userCount()==0));return;}
             if(path.equals("/api/v1/setup")&&method.equals("POST")){setup(x);return;}
             if(path.equals("/api/v1/login")&&method.equals("POST")){login(x);return;}
@@ -106,6 +107,13 @@ public final class WebPanelServer {
             if(path.equals("/api/v1/player-intelligence")&&method.equals("GET")){json(x,200,db.playerDirectory(query(x).getOrDefault("search",""),queryInt(x,"limit",100)));return;}
             if(path.startsWith("/api/v1/players/")&&method.equals("GET")){String uuid=path.substring("/api/v1/players/".length());try{UUID.fromString(uuid);}catch(IllegalArgumentException bad){json(x,400,Map.of("error","Invalid UUID"));return;}json(x,200,db.playerProfile(uuid,queryInt(x,"limit",100)));return;}
             if(path.startsWith("/api/v1/players/")&&method.equals("POST")){playerAction(x,session,path);return;}
+            if(path.equals("/api/v1/velocity-config/backups")&&method.equals("GET")){json(x,200,velocityConfigBackups());return;}
+            if(path.equals("/api/v1/velocity-config/backups/restore")&&method.equals("POST")){requireOwner(x,session);restoreVelocityConfigBackup(x,session);return;}
+            if(path.equals("/api/v1/servers/config")&&method.equals("GET")){json(x,200,serverConfigurationView());return;}
+            if(path.equals("/api/v1/servers")&&method.equals("POST")){requireOwner(x,session);createBackend(x,session);return;}
+            if(path.startsWith("/api/v1/servers/")&&path.endsWith("/config")&&method.equals("GET")){json(x,200,serverConfigurationView());return;}
+            if(path.startsWith("/api/v1/servers/")&&method.equals("PUT")){requireOwner(x,session);updateBackend(x,session,URLDecoder.decode(path.substring("/api/v1/servers/".length()),StandardCharsets.UTF_8));return;}
+            if(path.startsWith("/api/v1/servers/")&&method.equals("DELETE")){requireOwner(x,session);deleteBackend(x,session,URLDecoder.decode(path.substring("/api/v1/servers/".length()),StandardCharsets.UTF_8));return;}
             if(path.equals("/api/v1/routing")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR");json(x,200,readRouting());return;}
             if(path.equals("/api/v1/routing")&&method.equals("PUT")){requireOwner(x,session);Map<?,?> b=body(x);Object raw=b.get("fallbackOrder");if(!(raw instanceof List<?> list)||list.isEmpty()){json(x,400,Map.of("error","fallbackOrder must be a non-empty array of backend names"));return;}List<String> order=new ArrayList<>();Set<String> known=new HashSet<>();for(RegisteredServer rs:proxy.getAllServers())known.add(rs.getServerInfo().getName());for(Object item:list){String name=String.valueOf(item);if(!known.contains(name)||order.contains(name)){json(x,400,Map.of("error","Fallback order contains an unknown or duplicate backend: "+name));return;}order.add(name);}writeRouting(order);db.audit(session.username,"ROUTING_UPDATED",order.get(0),clientIp(x),gson.toJson(order));json(x,200,Map.of("ok",true,"defaultServer",order.get(0),"fallbackOrder",order,"message","Saved to velocity.toml. Restart Velocity to apply routing changes."));return;}
             if(path.equals("/api/v1/servers")&&method.equals("GET")){json(x,200,serversView());return;}
@@ -173,11 +181,23 @@ public final class WebPanelServer {
     private Path velocityTomlPath() { Path p=dataDirectory.toAbsolutePath();Path plugins=p.getParent();Path root=plugins==null?null:plugins.getParent();return root==null?p.resolve("velocity.toml"):root.resolve("velocity.toml"); }
     private Map<String,Object> readRouting() throws IOException {
         Path file=velocityTomlPath();if(!Files.isRegularFile(file))throw new IOException("velocity.toml was not found at "+file);
-        String text=Files.readString(file,StandardCharsets.UTF_8);String section=tomlSection(text,"servers");List<String> order=new ArrayList<>();java.util.regex.Matcher m=java.util.regex.Pattern.compile("(?m)^\\s*try\\s*=\\s*\\[(.*?)\\]").matcher(section);
-        if(m.find()){java.util.regex.Matcher q=java.util.regex.Pattern.compile("[\"']([^\"']+)[\"']").matcher(m.group(1));while(q.find())order.add(q.group(1));}
+        List<String> order = configuredFallbackOrder();
         if(order.isEmpty()&&!proxy.getAllServers().isEmpty())order.add(proxy.getAllServers().iterator().next().getServerInfo().getName());
         Map<String,Object> result=new LinkedHashMap<>();result.put("configPath",file.toString());result.put("fallbackOrder",order);result.put("defaultServer",order.isEmpty()?null:order.get(0));result.put("availableServers",proxy.getAllServers().stream().map(r->r.getServerInfo().getName()).sorted().toList());return result;
     }
+    private List<String> configuredFallbackOrder() throws IOException {
+        Path file = velocityTomlPath();
+        if (!Files.isRegularFile(file)) throw new IOException("velocity.toml was not found at " + file);
+        String section = tomlSection(Files.readString(file, StandardCharsets.UTF_8), "servers");
+        List<String> order = new ArrayList<>();
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("(?m)^\\s*try\\s*=\\s*\\[(.*?)\\]").matcher(section);
+        if (matcher.find()) {
+            java.util.regex.Matcher names = java.util.regex.Pattern.compile("[\"']([^\"']+)[\"']").matcher(matcher.group(1));
+            while (names.find()) order.add(names.group(1));
+        }
+        return order;
+    }
+
     private void writeRouting(List<String> order) throws IOException {
         Path file = velocityTomlPath();
         if (!Files.isRegularFile(file)) {
@@ -208,20 +228,269 @@ public final class WebPanelServer {
         }
         String newText = original.substring(0, sectionMatcher.start(2)) + updatedBody + original.substring(sectionMatcher.end(2));
 
+        backupVelocityConfig(file);
+        writeAtomically(file, newText);
+    }
+    private Map<String, String> configuredServerAddresses() throws IOException {
+        Path file = velocityTomlPath();
+        if (!Files.isRegularFile(file)) throw new IOException("velocity.toml was not found at " + file);
+        String section = tomlSection(Files.readString(file, StandardCharsets.UTF_8), "servers");
+        Map<String, String> result = new LinkedHashMap<>();
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                "(?m)^\\s*(?:\"([^\"]+)\"|([A-Za-z0-9_-]+))\\s*=\\s*\"((?:\\\\.|[^\"])*)\"\\s*(?:#.*)?$").matcher(section);
+        while (matcher.find()) {
+            String name = matcher.group(1) != null ? matcher.group(1) : matcher.group(2);
+            String address = matcher.group(3).replace("\\\"", "\"").replace("\\\\", "\\");
+            result.put(name, address);
+        }
+        return result;
+    }
+
+    private Map<String, Object> serverConfigurationView() throws IOException {
+        Path file = velocityTomlPath();
+        Map<String, String> configured = configuredServerAddresses();
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (Map.Entry<String, String> entry : configured.entrySet()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("name", entry.getKey());
+            row.put("configuredAddress", entry.getValue());
+            String host = entry.getValue(); int port = 25565;
+            try {
+                String[] parsed = splitHostPort(entry.getValue()); host = parsed[0]; port = Integer.parseInt(parsed[1]);
+            } catch (Exception ignored) { }
+            row.put("host", host); row.put("port", port);
+            RegisteredServer live = proxy.getServer(entry.getKey()).orElse(null);
+            row.put("registered", live != null);
+            row.put("playerCount", live == null ? 0 : live.getPlayersConnected().size());
+            BackendHealth health = backendHealth.get(entry.getKey());
+            row.put("health", health == null ? (live == null ? "NOT_REGISTERED" : "CHECKING") : health.status);
+            rows.add(row);
+        }
+        rows.sort(Comparator.comparing(row -> String.valueOf(row.get("name")), String.CASE_INSENSITIVE_ORDER));
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("configPath", file.toString());
+        result.put("backupPath", file.resolveSibling(file.getFileName() + ".vertex-backup").toString());
+        result.put("servers", rows);
+        result.put("registeredCount", proxy.getAllServers().size());
+        result.put("configuredCount", configured.size());
+        result.put("fallbackOrder", readRouting().get("fallbackOrder"));
+        return result;
+    }
+
+    private List<Map<String, Object>> velocityConfigBackups() throws IOException {
+        Path history = dataDirectory.resolve("config-backups");
+        if (!Files.isDirectory(history)) return List.of();
+        List<Map<String, Object>> result = new ArrayList<>();
+        try (var stream = Files.list(history)) {
+            for (Path file : stream.filter(Files::isRegularFile)
+                    .filter(f -> f.getFileName().toString().matches("velocity-\\d{8}-\\d{6}-\\d{3}\\.toml"))
+                    .sorted(Comparator.comparingLong((Path f) -> f.toFile().lastModified()).reversed()).limit(20).toList()) {
+                Map<String, Object> row = new LinkedHashMap<>();
+                row.put("name", file.getFileName().toString());
+                row.put("modifiedAt", Files.getLastModifiedTime(file).toMillis() / 1000L);
+                row.put("sizeBytes", Files.size(file));
+                result.add(row);
+            }
+        }
+        return result;
+    }
+
+    private void restoreVelocityConfigBackup(HttpExchange x, Session session) throws Exception {
+        Map<?, ?> b = body(x);
+        String filename = string(b, "filename", "");
+        if (!filename.matches("velocity-\\d{8}-\\d{6}-\\d{3}\\.toml")) {
+            json(x, 400, Map.of("error", "Invalid backup filename.")); return;
+        }
+        Path history = dataDirectory.resolve("config-backups").toAbsolutePath().normalize();
+        Path backup = history.resolve(filename).normalize();
+        if (!backup.startsWith(history) || !Files.isRegularFile(backup)) {
+            json(x, 404, Map.of("error", "Configuration backup not found.")); return;
+        }
+        String content = Files.readString(backup, StandardCharsets.UTF_8);
+        if (!content.contains("[servers]") || tomlSection(content, "servers").isBlank()) {
+            json(x, 400, Map.of("error", "Backup does not contain a usable [servers] section.")); return;
+        }
+        Path current = velocityTomlPath();
+        if (!Files.isRegularFile(current)) { json(x, 500, Map.of("error", "Current velocity.toml was not found.")); return; }
+        backupVelocityConfig(current);
+        writeAtomically(current, content);
+        db.audit(session.username, "VELOCITY_CONFIG_RESTORED", filename, clientIp(x), "Restored native Velocity configuration backup; proxy restart required");
+        json(x, 200, Map.of("ok", true, "restored", filename, "restartRequired", true,
+                "message", "Configuration restored. Restart Velocity to apply the restored configuration to the running proxy."));
+    }
+
+    private void createBackend(HttpExchange x, Session session) throws Exception {
+        Map<?, ?> b = body(x);
+        String name = validServerName(string(b, "name", ""));
+        String host = validHost(string(b, "host", ""));
+        int port = validPort(b.get("port"));
+        Map<String, String> configured = configuredServerAddresses();
+        if (configured.containsKey(name) || proxy.getServer(name).isPresent()) {
+            json(x, 409, Map.of("error", "A backend with this name already exists.")); return;
+        }
+        String address = formatHostPort(host, port);
+        ServerInfo info = new ServerInfo(name, createAddress(host, port));
+        proxy.registerServer(info);
+        try { mutateServerToml(null, name, address, false); }
+        catch (Exception failure) { try { proxy.unregisterServer(info); } catch (Exception ignored) { } throw failure; }
+        db.audit(session.username, "BACKEND_CREATED", name, clientIp(x), address);
+        json(x, 201, Map.of("ok", true, "name", name, "address", address,
+                "message", "Backend added to velocity.toml and registered in the running proxy."));
+    }
+
+    private void updateBackend(HttpExchange x, Session session, String oldName) throws Exception {
+        Map<?, ?> b = body(x);
+        oldName = validServerName(oldName);
+        String newName = validServerName(string(b, "name", oldName));
+        String host = validHost(string(b, "host", ""));
+        int port = validPort(b.get("port"));
+        Map<String, String> configured = configuredServerAddresses();
+        String previousAddress = configured.get(oldName);
+        if (previousAddress == null) { json(x, 404, Map.of("error", "Backend is not defined in velocity.toml.")); return; }
+        if (!newName.equals(oldName) && (configured.containsKey(newName) || proxy.getServer(newName).isPresent())) {
+            json(x, 409, Map.of("error", "Another backend already uses that name.")); return;
+        }
+        RegisteredServer oldRegistered = proxy.getServer(oldName).orElse(null);
+        if (oldRegistered != null && !oldRegistered.getPlayersConnected().isEmpty()) {
+            json(x, 409, Map.of("error", "This backend has connected players. Transfer them before editing its name or address.")); return;
+        }
+        String address = formatHostPort(host, port);
+        ServerInfo oldInfo = oldRegistered == null ? null : oldRegistered.getServerInfo();
+        ServerInfo newInfo = new ServerInfo(newName, createAddress(host, port));
+        if (oldInfo != null) proxy.unregisterServer(oldInfo);
+        try {
+            proxy.registerServer(newInfo);
+            mutateServerToml(oldName, newName, address, false);
+        } catch (Exception failure) {
+            try { proxy.unregisterServer(newInfo); } catch (Exception ignored) { }
+            if (oldInfo != null) try { proxy.registerServer(oldInfo); } catch (Exception ignored) { }
+            throw failure;
+        }
+        db.audit(session.username, "BACKEND_UPDATED", newName, clientIp(x), oldName + " -> " + address);
+        json(x, 200, Map.of("ok", true, "name", newName, "address", address,
+                "message", "Backend configuration saved and live registry updated."));
+    }
+
+    private void deleteBackend(HttpExchange x, Session session, String name) throws Exception {
+        name = validServerName(name);
+        Map<String, String> configured = configuredServerAddresses();
+        if (!configured.containsKey(name)) { json(x, 404, Map.of("error", "Backend is not defined in velocity.toml.")); return; }
+        RegisteredServer registered = proxy.getServer(name).orElse(null);
+        if (registered != null && !registered.getPlayersConnected().isEmpty()) {
+            json(x, 409, Map.of("error", "This backend has connected players. Transfer them before deleting it.")); return;
+        }
+        List<String> fallback = configuredFallbackOrder();
+        if (!fallback.isEmpty()) {
+            List<String> remainingFallback = new ArrayList<>();
+            for (String value : fallback) if (!name.equals(value)) remainingFallback.add(value);
+            if (remainingFallback.isEmpty()) { json(x, 409, Map.of("error", "Cannot delete the only fallback server. Configure another fallback first.")); return; }
+        } else if (configured.size() <= 1) {
+            json(x, 409, Map.of("error", "Cannot delete the last configured backend.")); return;
+        }
+        if (registered != null) proxy.unregisterServer(registered.getServerInfo());
+        try { mutateServerToml(name, null, null, true); }
+        catch (Exception failure) { if (registered != null) try { proxy.registerServer(registered.getServerInfo()); } catch (Exception ignored) { } throw failure; }
+        db.audit(session.username, "BACKEND_DELETED", name, clientIp(x), configured.get(name));
+        json(x, 200, Map.of("ok", true, "name", name, "message", "Backend removed from velocity.toml and the live registry."));
+    }
+
+    private String validServerName(String value) {
+        String name = value == null ? "" : value.trim();
+        if (!name.matches("[A-Za-z0-9_-]{1,32}") || name.equalsIgnoreCase("try"))
+            throw new IllegalArgumentException("Backend name must be 1–32 characters using letters, numbers, underscore or hyphen.");
+        return name;
+    }
+    private String validHost(String value) {
+        String host = value == null ? "" : value.trim();
+        if (host.startsWith("[") && host.endsWith("]")) host = host.substring(1, host.length() - 1);
+        if (host.isEmpty() || host.length() > 253 || host.chars().anyMatch(Character::isWhitespace)
+                || host.contains("/") || host.contains("\\") || host.contains("\"") || host.contains("#"))
+            throw new IllegalArgumentException("Enter a valid hostname or IP address. Do not include a port in the host field.");
+        if (host.contains(":") && !(host.matches("[0-9a-fA-F:.%]+")))
+            throw new IllegalArgumentException("IPv6 hosts may contain only IPv6 characters; enter IPv6 without square brackets.");
+        return host;
+    }
+    private int validPort(Object raw) {
+        int port; try { port = Integer.parseInt(String.valueOf(raw)); } catch (Exception e) { throw new IllegalArgumentException("Port must be a number between 1 and 65535."); }
+        if (port < 1 || port > 65535) throw new IllegalArgumentException("Port must be between 1 and 65535.");
+        return port;
+    }
+    private InetSocketAddress createAddress(String host, int port) { return InetSocketAddress.createUnresolved(host, port); }
+    private String formatHostPort(String host, int port) { return (host.contains(":") ? "[" + host + "]" : host) + ":" + port; }
+    private String[] splitHostPort(String value) {
+        String host, port;
+        if (value.startsWith("[")) { int close = value.indexOf(']'); if (close < 0 || close + 1 >= value.length() || value.charAt(close + 1) != ':') throw new IllegalArgumentException("Invalid IPv6 backend address"); host = value.substring(1, close); port = value.substring(close + 2); }
+        else { int colon = value.lastIndexOf(':'); if (colon <= 0) throw new IllegalArgumentException("Backend address must include a port"); host = value.substring(0, colon); port = value.substring(colon + 1); }
+        int parsedPort = Integer.parseInt(port); if (parsedPort < 1 || parsedPort > 65535) throw new IllegalArgumentException("Invalid backend port");
+        return new String[]{host, String.valueOf(parsedPort)};
+    }
+
+    private void mutateServerToml(String oldName, String newName, String address, boolean delete) throws IOException {
+        Path file = velocityTomlPath();
+        if (!Files.isRegularFile(file)) throw new IOException("velocity.toml was not found at " + file + ". No file was modified.");
+        String original = Files.readString(file, StandardCharsets.UTF_8);
+        java.util.regex.Pattern sectionPattern = java.util.regex.Pattern.compile(
+                "(?ms)^(\\[servers\\][ \\t]*(?:#[^\\r\\n]*)?\\r?\\n)(.*?)(?=^\\[[^\\r\\n]+\\][ \\t]*(?:#[^\\r\\n]*)?$|\\z)");
+        java.util.regex.Matcher sectionMatcher = sectionPattern.matcher(original);
+        if (!sectionMatcher.find()) throw new IOException("[servers] section was not found in velocity.toml. No file was modified.");
+        String body = sectionMatcher.group(2);
+        String newline = original.contains("\r\n") ? "\r\n" : "\n";
+        if (oldName == null) {
+            if (configuredServerAddresses().containsKey(newName)) throw new IOException("A server with this name already exists in velocity.toml.");
+            String line = newName + " = \"" + tomlEscape(address) + "\"" + newline;
+            body = body + (body.isEmpty() || body.endsWith("\n") ? "" : newline) + line;
+        } else {
+            java.util.regex.Pattern entryPattern = java.util.regex.Pattern.compile(
+                    "(?m)^([ \\t]*)(?:\"" + java.util.regex.Pattern.quote(oldName) + "\"|" + java.util.regex.Pattern.quote(oldName) + ")[ \\t]*=[ \\t]*\"(?:\\\\.|[^\"]*)\"([ \\t]*(?:#.*)?)$");
+            java.util.regex.Matcher entryMatcher = entryPattern.matcher(body);
+            if (!entryMatcher.find()) throw new IOException("Could not locate the exact server entry for '" + oldName + "'. No file was modified.");
+            if (delete) {
+                java.util.regex.Pattern linePattern = java.util.regex.Pattern.compile("(?m)^[ \\t]*(?:\"" + java.util.regex.Pattern.quote(oldName) + "\"|" + java.util.regex.Pattern.quote(oldName) + ")[ \\t]*=[^\\r\\n]*(?:\\r?\\n|$)");
+                body = linePattern.matcher(body).replaceFirst("");
+            } else {
+                String replacement = entryMatcher.group(1) + newName + " = \"" + tomlEscape(address) + "\"" + entryMatcher.group(2);
+                body = entryMatcher.replaceFirst(java.util.regex.Matcher.quoteReplacement(replacement));
+            }
+            java.util.regex.Pattern tryPattern = java.util.regex.Pattern.compile("(?m)^([ \\t]*)try[ \\t]*=[ \\t]*\\[(.*?)\\]([ \\t]*(?:#.*)?)$");
+            java.util.regex.Matcher tryMatcher = tryPattern.matcher(body);
+            if (tryMatcher.find()) {
+                List<String> order = new ArrayList<>();
+                java.util.regex.Matcher names = java.util.regex.Pattern.compile("[\"']([^\"']+)[\"']").matcher(tryMatcher.group(2));
+                while (names.find()) { String value = names.group(1); if (delete) { if (!value.equals(oldName)) order.add(value); } else { order.add(value.equals(oldName) ? newName : value); } }
+                if (delete && order.isEmpty()) throw new IOException("Cannot remove the only fallback entry. Add another fallback before deleting this backend.");
+                String joined = String.join(", ", order.stream().map(n -> "\"" + tomlEscape(n) + "\"").toList());
+                String replacement = tryMatcher.group(1) + "try = [" + joined + "]" + tryMatcher.group(3);
+                body = tryMatcher.replaceFirst(java.util.regex.Matcher.quoteReplacement(replacement));
+            }
+        }
+        String updated = original.substring(0, sectionMatcher.start(2)) + body + original.substring(sectionMatcher.end(2));
+        backupVelocityConfig(file);
+        writeAtomically(file, updated);
+    }
+    private String tomlEscape(String value) { return value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r"); }
+    private void backupVelocityConfig(Path file) throws IOException {
         Path backup = file.resolveSibling(file.getFileName() + ".vertex-backup");
         Files.copy(file, backup, StandardCopyOption.REPLACE_EXISTING);
-        Path tmp = file.resolveSibling(file.getFileName() + ".vertex-tmp");
-        try {
-            Files.writeString(tmp, newText, StandardCharsets.UTF_8);
-            try {
-                Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-            } catch (AtomicMoveNotSupportedException unsupported) {
-                Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
-            }
-        } finally {
-            Files.deleteIfExists(tmp);
+        Path history = dataDirectory.resolve("config-backups"); Files.createDirectories(history);
+        String stamp = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS").withZone(java.time.ZoneOffset.UTC).format(Instant.now());
+        Files.copy(file, history.resolve("velocity-" + stamp + ".toml"), StandardCopyOption.COPY_ATTRIBUTES);
+        try (var files = Files.list(history)) {
+            List<Path> old = files.filter(Files::isRegularFile)
+                    .sorted(Comparator.comparingLong((Path path) -> path.toFile().lastModified()).reversed())
+                    .skip(20)
+                    .collect(java.util.stream.Collectors.toList());
+            for (Path path : old) Files.deleteIfExists(path);
         }
     }
+    private void writeAtomically(Path file, String content) throws IOException {
+        Path tmp = file.resolveSibling(file.getFileName() + ".vertex-tmp");
+        try {
+            Files.writeString(tmp, content, StandardCharsets.UTF_8);
+            try { Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE); }
+            catch (AtomicMoveNotSupportedException unsupported) { Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING); }
+        } finally { Files.deleteIfExists(tmp); }
+    }
+
     private static String tomlSection(String text, String name) {
         java.util.regex.Pattern pattern = java.util.regex.Pattern.compile(
                 "(?ms)^\\[" + java.util.regex.Pattern.quote(name) + "\\][ \t]*(?:#[^\\r\\n]*)?\\r?\\n?(.*?)(?=^\\[[^\\r\\n]+\\][ \t]*(?:#[^\\r\\n]*)?$|\\z)");
