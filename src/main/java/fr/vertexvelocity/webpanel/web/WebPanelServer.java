@@ -524,7 +524,7 @@ public final class WebPanelServer {
         String stamp = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS").withZone(java.time.ZoneOffset.UTC).format(Instant.now());
         Files.copy(file, history.resolve("velocity-" + stamp + ".toml"), StandardCopyOption.COPY_ATTRIBUTES);
         try (var files = Files.list(history)) {
-            List<Path> old = files.filter(Files::isRegularFile).sorted(Comparator.comparingLong(path -> path.toFile().lastModified()).reversed()).skip(20).toList();
+            List<Path> old = files.filter(Files::isRegularFile).sorted(Comparator.comparingLong((Path path) -> path.toFile().lastModified()).reversed()).skip(20).toList();
             for (Path path : old) Files.deleteIfExists(path);
         }
     }
@@ -605,7 +605,7 @@ public final class WebPanelServer {
                 String payload=gson.toJson(Map.of("username","Vertex Velocity","embeds",List.of(embed)));
                 HttpURLConnection c=(HttpURLConnection)URI.create(url).toURL().openConnection();c.setRequestMethod("POST");c.setConnectTimeout(3000);c.setReadTimeout(3000);c.setDoOutput(true);c.setRequestProperty("Content-Type","application/json; charset=utf-8");byte[] bytes=payload.getBytes(StandardCharsets.UTF_8);c.setFixedLengthStreamingMode(bytes.length);try(OutputStream out=c.getOutputStream()){out.write(bytes);}int code=c.getResponseCode();if(code<200||code>=300)logger.warn("Discord webhook returned HTTP {}",code);c.disconnect();
             } catch(Exception e) { logger.warn("Could not deliver Discord alert: {}",e.getMessage()); }
-        },executor);
+        });
     }
 
     private void updateConfig(HttpExchange x,Session session) throws Exception {
