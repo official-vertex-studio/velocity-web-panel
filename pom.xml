@@ -39,7 +39,7 @@
           <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
           <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer"><resource>META-INF/spring.handlers</resource></transformer>
           <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer"><resource>META-INF/spring.schemas</resource></transformer>
-          <transformer implementation="org.apache.maven.plugins.shade.resource.PropertiesMergingResourceTransformer"><resource>META-INF/spring.factories</resource></transformer>
+          <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer"><resource>META-INF/spring.factories</resource></transformer>
           <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer"><resource>META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports</resource></transformer>
         </transformers><relocations><relocation><pattern>org.yaml.snakeyaml</pattern><shadedPattern>fr.vertexvelocity.libs.snakeyaml</shadedPattern></relocation><relocation><pattern>com.google.gson</pattern><shadedPattern>fr.vertexvelocity.libs.gson</shadedPattern></relocation></relocations><filters><filter><artifact>*:*</artifact><excludes><exclude>META-INF/*.SF</exclude><exclude>META-INF/*.DSA</exclude><exclude>META-INF/*.RSA</exclude></excludes></filter></filters></configuration></execution></executions></plugin>
   </plugins></build>
