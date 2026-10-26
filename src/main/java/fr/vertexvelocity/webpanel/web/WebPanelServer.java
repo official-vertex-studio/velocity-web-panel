@@ -3,6 +3,10 @@ package fr.vertexvelocity.webpanel.web;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.sun.net.httpserver.*;
+import fr.vertexvelocity.webpanel.spring.PanelWebApplication;
+import org.springframework.boot.WebApplicationType;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.ConfigurableApplicationContext;
 import com.velocitypowered.api.proxy.*;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import com.velocitypowered.api.proxy.server.ServerInfo;
@@ -14,12 +18,10 @@ import fr.vertexvelocity.webpanel.db.PanelDatabase.UserRecord;
 import fr.vertexvelocity.webpanel.security.PasswordUtil;
 import fr.vertexvelocity.webpanel.security.Totp;
 
-import javax.net.ssl.*;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.security.KeyStore;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
@@ -31,8 +33,7 @@ public final class WebPanelServer {
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private final Map<String, PendingLogin> pendingLogins = new ConcurrentHashMap<>();
     private final Map<String, ArrayDeque<Long>> loginAttempts = new ConcurrentHashMap<>();
-    private final List<HttpServer> servers = new CopyOnWriteArrayList<>();
-    private final ExecutorService executor = Executors.newCachedThreadPool(r -> { Thread t=new Thread(r,"Vertex-WebPanel-HTTP");t.setDaemon(true);return t; });
+    private final List<ConfigurableApplicationContext> springContexts = new CopyOnWriteArrayList<>();
     private final AtomicInteger httpErrors = new AtomicInteger();
     private volatile boolean maintenanceEnabled;
     private volatile String maintenanceMessage = "The network is under maintenance.";
@@ -42,45 +43,93 @@ public final class WebPanelServer {
 
     public void start() throws Exception {
         if (!config.webEnabled()) { logger.info("Web panel is disabled in config.yml"); return; }
-        String mode=config.webMode();
-        if (!Set.of("HTTP","HTTPS","BOTH").contains(mode)) throw new IllegalStateException("web-panel.mode must be HTTP, HTTPS or BOTH");
-        if ((mode.equals("HTTPS") || mode.equals("BOTH")) && !config.httpsEnabled()) throw new IllegalStateException("HTTPS requested but web-panel.https.enabled is false");
+        String mode = config.webMode();
+        if (!Set.of("HTTP", "HTTPS", "BOTH").contains(mode)) {
+            throw new IllegalStateException("web-panel.mode must be HTTP, HTTPS or BOTH");
+        }
+        if ((mode.equals("HTTPS") || mode.equals("BOTH")) && !config.httpsEnabled()) {
+            throw new IllegalStateException("HTTPS requested but web-panel.https.enabled is false");
+        }
+        if (mode.equals("HTTPS") || mode.equals("BOTH")) {
+            validateKeystore();
+        }
         try {
-            if (mode.equals("HTTPS") || mode.equals("BOTH")) startHttps();
-            if (mode.equals("HTTP") || mode.equals("BOTH")) startHttp();
-        } catch (Exception e) { stop(); throw e; }
-        if (servers.isEmpty()) throw new IllegalStateException("No web listener started. Check web-panel.mode and configuration.");
-        long interval=Math.max(5,config.sampleSeconds());
+            PanelWebApplication.setDelegate(this);
+            if (mode.equals("HTTP") || mode.equals("BOTH")) {
+                startSpringContext(false);
+            }
+            if (mode.equals("HTTPS")) {
+                startSpringContext(true);
+            } else if (mode.equals("BOTH")) {
+                startSpringContext(true);
+            }
+        } catch (Exception e) {
+            stop();
+            throw e;
+        }
+        if (springContexts.isEmpty()) throw new IllegalStateException("No Spring Boot web listener started.");
+        long interval = Math.max(5, config.sampleSeconds());
         proxy.getScheduler().buildTask(getPluginOwner(), () -> {
-            db.sampleMetric(proxy.getPlayerCount(), proxy.getAllServers().size(), Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond()));
+            db.sampleMetric(proxy.getPlayerCount(), proxy.getAllServers().size(), Math.max(0, Instant.now().getEpochSecond() - startedAt.getEpochSecond()));
             db.prune(config.retentionDays());
             probeBackends();
-        }).repeat(interval,TimeUnit.SECONDS).schedule();
+        }).repeat(interval, TimeUnit.SECONDS).schedule();
+    }
+
+    private void validateKeystore() throws Exception {
+        String path = config.keystore();
+        if (path.isBlank()) throw new IllegalStateException("HTTPS keystore path is empty");
+        java.security.KeyStore keyStore = java.security.KeyStore.getInstance(config.keystoreType());
+        try (InputStream input = Files.newInputStream(Path.of(path))) {
+            keyStore.load(input, config.keystorePassword().toCharArray());
+        }
+    }
+
+    private void startSpringContext(boolean https) {
+        int port = https ? config.httpsPort() : config.httpPort();
+        Map<String, Object> properties = new LinkedHashMap<>();
+        properties.put("server.port", port);
+        properties.put("server.address", config.bindAddress());
+        properties.put("server.ssl.enabled", https);
+        properties.put("spring.main.banner-mode", "off");
+        properties.put("spring.main.web-application-type", "servlet");
+        properties.put("spring.jmx.enabled", "false");
+        properties.put("server.error.include-message", "never");
+        properties.put("server.error.include-stacktrace", "never");
+        properties.put("server.shutdown", "graceful");
+        properties.put("spring.lifecycle.timeout-per-shutdown-phase", "5s");
+        properties.put("server.max-http-request-header-size", "16KB");
+        properties.put("logging.level.root", "WARN");
+        if (https) {
+            properties.put("server.ssl.key-store", Path.of(config.keystore()).toAbsolutePath().toString());
+            properties.put("server.ssl.key-store-password", config.keystorePassword());
+            properties.put("server.ssl.key-store-type", config.keystoreType());
+            properties.put("server.ssl.enabled-protocols", "TLSv1.3,TLSv1.2");
+        }
+        ConfigurableApplicationContext context = new SpringApplicationBuilder(PanelWebApplication.class)
+                .web(WebApplicationType.SERVLET)
+                .registerShutdownHook(false)
+                .properties(properties)
+                .run();
+        springContexts.add(context);
+        logger.info("Vertex Web Panel Spring Boot {} listener started on {}:{}",
+                https ? "HTTPS" : "HTTP", config.bindAddress(), port);
     }
 
     private Object pluginOwner;
     public void setPluginOwner(Object owner) { this.pluginOwner=owner; }
     private Object getPluginOwner() { if(pluginOwner==null) throw new IllegalStateException("Plugin scheduler owner was not provided"); return pluginOwner; }
 
-    private void startHttp() throws IOException { HttpServer s=HttpServer.create(new InetSocketAddress(config.bindAddress(),config.httpPort()),64); configure(s); servers.add(s);s.start();logger.info("Vertex Web Panel HTTP listening on {}:{}",config.bindAddress(),config.httpPort()); }
-    private void startHttps() throws Exception {
-        String path=config.keystore(); if(path.isBlank())throw new IllegalStateException("HTTPS keystore path is empty");
-        char[] password=config.keystorePassword().toCharArray(); KeyStore ks=KeyStore.getInstance(config.keystoreType());
-        try(InputStream in=Files.newInputStream(Path.of(path))){ks.load(in,password);}
-        KeyManagerFactory kmf=KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());kmf.init(ks,password);
-        SSLContext ssl=SSLContext.getInstance("TLS");ssl.init(kmf.getKeyManagers(),null,null);
-        HttpsServer s=HttpsServer.create(new InetSocketAddress(config.bindAddress(),config.httpsPort()),64);
-        s.setHttpsConfigurator(new HttpsConfigurator(ssl){@Override public void configure(HttpsParameters params){SSLContext c=getSSLContext();SSLEngine e=c.createSSLEngine();params.setNeedClientAuth(false);params.setCipherSuites(e.getEnabledCipherSuites());params.setProtocols(Arrays.stream(e.getEnabledProtocols()).filter(p->p.equals("TLSv1.3")||p.equals("TLSv1.2")).toArray(String[]::new));params.setSSLParameters(c.getDefaultSSLParameters());}});
-        configure(s);servers.add(s);s.start();logger.info("Vertex Web Panel HTTPS listening on {}:{}",config.bindAddress(),config.httpsPort());
+    public void handleExchange(HttpExchange x) throws IOException {
+        handle(x);
     }
-    private void configure(HttpServer s) { s.setExecutor(executor);s.createContext("/",this::handle); }
 
     private void handle(HttpExchange x) throws IOException {
         try {
             addSecurityHeaders(x); String path=x.getRequestURI().getPath(); String method=x.getRequestMethod().toUpperCase(Locale.ROOT);
             if(path.equals("/")||path.equals("/index.html")){serveResource(x,"/web/index.html","text/html; charset=utf-8");return;}
             if(path.startsWith("/assets/")){serveResource(x,"/web"+path,"text/plain; charset=utf-8");return;}
-            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","1.1.0","timestamp",Instant.now().getEpochSecond()));return;}
+            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","2.0.0","timestamp",Instant.now().getEpochSecond()));return;}
             if(path.equals("/api/v1/setup-status")&&method.equals("GET")){json(x,200,Map.of("needsSetup",db.userCount()==0));return;}
             if(path.equals("/api/v1/setup")&&method.equals("POST")){setup(x);return;}
             if(path.equals("/api/v1/login")&&method.equals("POST")){login(x);return;}
@@ -475,10 +524,7 @@ public final class WebPanelServer {
         String stamp = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS").withZone(java.time.ZoneOffset.UTC).format(Instant.now());
         Files.copy(file, history.resolve("velocity-" + stamp + ".toml"), StandardCopyOption.COPY_ATTRIBUTES);
         try (var files = Files.list(history)) {
-            List<Path> old = files.filter(Files::isRegularFile)
-                    .sorted(Comparator.comparingLong((Path path) -> path.toFile().lastModified()).reversed())
-                    .skip(20)
-                    .collect(java.util.stream.Collectors.toList());
+            List<Path> old = files.filter(Files::isRegularFile).sorted(Comparator.comparingLong(path -> path.toFile().lastModified()).reversed()).skip(20).toList();
             for (Path path : old) Files.deleteIfExists(path);
         }
     }
@@ -596,7 +642,15 @@ public final class WebPanelServer {
     private void serveResource(HttpExchange x,String resource,String type)throws IOException{try(InputStream in=getClass().getResourceAsStream(resource)){if(in==null){json(x,404,Map.of("error","Resource not found"));return;}byte[] b=in.readAllBytes();x.getResponseHeaders().set("Content-Type",type);x.sendResponseHeaders(200,b.length);x.getResponseBody().write(b);}}
     private void json(HttpExchange x,int status,Object data)throws IOException{byte[] b=gson.toJson(data).getBytes(StandardCharsets.UTF_8);x.getResponseHeaders().set("Content-Type","application/json; charset=utf-8");x.sendResponseHeaders(status,b.length);x.getResponseBody().write(b);}
     private void safeJson(HttpExchange x,int status,Object data){try{json(x,status,data);}catch(Exception ignored){}}
-    public void stop(){for(HttpServer s:servers)s.stop(1);servers.clear();executor.shutdownNow();sessions.clear();}
+    public void stop() {
+        for (ConfigurableApplicationContext context : springContexts) {
+            try { context.close(); } catch (Exception e) { logger.warn("Failed to stop Spring Boot panel context cleanly", e); }
+        }
+        springContexts.clear();
+        PanelWebApplication.clearDelegate(this);
+        sessions.clear();
+        pendingLogins.clear();
+    }
     private record Session(String username,String role,long expiresAt,boolean apiKey){}
     private record PendingLogin(String username,String role,long expiresAt){}
     private record BackendHealth(String status,long latencyMs,long checkedAt){}

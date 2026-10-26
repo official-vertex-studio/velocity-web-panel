@@ -20,7 +20,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Optional;
 
-@Plugin(id = "vertexvelocitywebpanel", name = "Vertex Velocity Web Panel", version = "1.1.0", description = "Premium live administration panel for Velocity", authors = {"Vertex Studio"})
+@Plugin(id = "vertexvelocitywebpanel", name = "Vertex Velocity Web Panel", version = "2.0.0", description = "Premium live administration panel for Velocity", authors = {"Vertex Studio"})
 public final class VertexVelocityWebPanel {
     private final ProxyServer proxy;
     private final Logger logger;

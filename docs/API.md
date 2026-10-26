@@ -19,13 +19,13 @@ Base path: `/api/v1`. JSON is used for request and response bodies. Limits are c
 Request:
 
 ```json
-{"name":"Discord bot"}
+{"name":"Trusted read-only client"}
 ```
 
 Response (the raw key is shown once):
 
 ```json
-{"ok":true,"name":"Discord bot","apiKey":"vv_live_...","warning":"Copy this key now. It cannot be displayed again."}
+{"ok":true,"name":"Trusted read-only client","apiKey":"vv_live_...","warning":"Copy this key now. It cannot be displayed again."}
 ```
 
 ### `GET /integrations/keys`
@@ -118,10 +118,6 @@ export async function vertexGet(path) {
 }
 ```
 
-### Discord bot usage
-
-Call the Node.js helper from a scheduled task or a Discord slash-command handler, then format only the fields needed for the response. Keep the API key in the bot's environment variables and never expose it in embeds or logs. Respect Discord's interaction response deadline and defer long-running commands before making network calls.
-
 ## Data semantics
 
 - UUID/player history exists only from the time the plugin started collecting events.
@@ -150,7 +146,7 @@ Each command has a `vertex...` alias, for example `/vertexstats`. Grant permissi
 
 ## More language examples
 
-Examples are provided in Node.js/Discord.js, Go, Java, Python, C#, PHP, Ruby, Rust, PowerShell, and Kotlin under `examples/`. They use the same language-neutral HTTPS REST API and a read-only bearer API key. Set `VERTEX_URL` to the panel base URL and `VERTEX_API_KEY` to an API key created by the owner in **API & Integrations**. Never embed keys in a public client or commit them to source control.
+Language-neutral client examples are provided under `examples/`. They use the same HTTPS REST API and a read-only bearer API key. Set `VERTEX_URL` to the panel base URL and `VERTEX_API_KEY` to a key created by the owner in **API & Integrations**. Never embed keys in a public client or commit them to source control.
 
 Examples of filtered requests:
 
@@ -175,31 +171,6 @@ All SDKs call the same language-neutral REST routes; there is no separate API im
 |---|---|---|
 | Python | `examples/python/vertex_client.py` | health, stats, players and filters, player profile, player directory, servers/details, commands, network, activity, events, analytics, maintenance |
 | Node.js | `examples/node/vertex-client.mjs` | health, stats, players and filters, player profile, player directory, servers/details, commands, network, activity, events, analytics, maintenance |
-| Discord.js | `examples/discordjs/status-command.js` | reusable status embed; import into a bot command |
 | Go, Java, C#/.NET, PHP, Ruby, Rust, PowerShell, Kotlin | `examples/` language folders | authenticated HTTP/JSON examples; call additional routes by changing the `/api/v1/...` path in the request |
 
 API keys are read-only. A request using an API key to a write endpoint must not be used for player actions, routing changes, maintenance changes, account management, or configuration updates.
-
-## Python Discord bot (`discord.py`) walkthrough
-
-The complete sample is `examples/python/discord_bot.py`; it registers `/minecraft` and `/minecraft_players`. It uses `examples/python/vertex_client.py`.
-
-1. Create a read-only API key in the panel's **API & Integrations** page. Copy it once and keep it private.
-2. Install Python 3.10 or newer and run `python -m pip install -U discord.py requests`.
-3. In the Discord Developer Portal, create a bot and invite it with the `bot` and `applications.commands` scopes. Keep the bot token private.
-4. Set environment variables on the machine/container that runs the bot:
-
-```bash
-# Linux / Pterodactyl startup environment
-export DISCORD_TOKEN='your-discord-bot-token'
-export VERTEX_URL='https://panel.example.com'
-export VERTEX_API_KEY='vv_live_your_read_only_key'
-python examples/python/discord_bot.py
-```
-
-On Windows PowerShell, use `$env:DISCORD_TOKEN='...'`, `$env:VERTEX_URL='https://panel.example.com'`, and `$env:VERTEX_API_KEY='...'`, then run `python examples/python/discord_bot.py`. Set these as panel/container environment variables in production rather than committing them to a file. `VERTEX_URL` is the panel origin only; the SDK adds `/api/v1` itself. Use HTTPS for remote access.
-
-5. Once the bot logs in and syncs slash commands, run `/minecraft` for an overview or `/minecraft_players` to privately view the online player list. The example defers its interaction before making HTTP requests so Discord's response deadline is respected.
-6. If commands do not appear, check that the bot was invited with `applications.commands`, that the bot is online, and that command sync succeeded. If the API returns HTTP 401, create a new key or verify the environment variables; if it returns HTTP 403, ensure the key is being used only for supported read-only routes.
-
-The sample intentionally sends generic errors to Discord so it does not disclose API keys, raw headers, or private panel details. Check server-side bot logs when troubleshooting, but do not log the key.

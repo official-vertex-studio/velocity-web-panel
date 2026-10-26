@@ -15,9 +15,7 @@ The REST API is shared across all supported languages. Set `VERTEX_URL` to the p
 ## SDKs
 
 - Python: `examples/python/vertex_client.py` (complete helper)
-- Python Discord bot: `examples/python/discord_bot.py` (`discord.py`, `/minecraft`, `/minecraft_players`)
 - Node.js: `examples/node/vertex-client.mjs` (complete helper)
-- Discord.js v14 embed helper: `examples/discordjs/status-command.js`
 - Go: `examples/go/main.go`
 - Java: `examples/java/VertexApiExample.java`
 - C#/.NET: `examples/dotnet/Program.cs`
