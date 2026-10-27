@@ -1,0 +1,42 @@
+# Vertex Velocity Web Panel 2.0.0 — primary configuration
+web-panel:
+  enabled: true
+  # AUTO chooses HTTPS when a valid certificate/private key or keystore is discovered;
+  # otherwise it starts HTTP and logs a warning. HTTP, HTTPS and BOTH are explicit modes.
+  mode: AUTO
+  # Set true only behind a trusted HTTPS reverse proxy that terminates TLS.
+  reverse-proxy: false
+  bind-address: 127.0.0.1
+  http-port: 25569
+  https-port: 8443
+  https:
+    enabled: true
+    # Optional overrides. In AUTO mode the detector searches TLS assets automatically.
+    keystore: ''
+    keystore-password: ''
+    keystore-type: PKCS12
+    certificate: ''
+    private-key: ''
+security:
+  session-minutes: 60
+  login-attempts-per-minute: 8
+  trust-proxy-headers: false
+statistics:
+  sample-seconds: 15
+  retention-days: 30
+  backend-connect-timeout-ms: 1500
+discord:
+  enabled: false
+  webhook-url: ''
+
+# Automatic ACME (Let's Encrypt) certificates via Certbot HTTP-01 webroot.
+# The domain must resolve to this server and public TCP/80 must reach the HTTP listener.
+# Certbot must be installed in the same runtime/container. ACME state is stored in the plugin data folder. Keep disabled until configured.
+acme:
+  enabled: false
+  domain: ''
+  email: ''
+  certbot-command: certbot
+  renewal-check-hours: 12
+  # true uses Let's Encrypt staging; certificates are intentionally not browser-trusted.
+  staging: false

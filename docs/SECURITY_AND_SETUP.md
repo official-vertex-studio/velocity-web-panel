@@ -12,7 +12,7 @@ Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes, not plaintext. Login a
 
 ## HTTP / HTTPS configuration
 
-The Settings page can save the following options to the plugin `config.yml`: enabled state, HTTP/HTTPS/BOTH mode, bind address, ports, TLS keystore path/type, sample interval, retention, login attempt limit and session lifetime. The plugin does not hot-rebind sockets: restart Velocity after changing the listener, bind or TLS options.
+The Settings page can save the following options to the plugin `config.yml`: enabled state, HTTP/HTTPS/BOTH mode, bind address, ports, TLS keystore path/type, sample interval, retention, login attempt limit and session lifetime. The plugin does not hot-rebind sockets: restart Velocity after changing the listener, bind or TLS options. Existing PEM certificates are accepted only when the certificate is currently valid and the unencrypted PKCS#8 private key cryptographically matches it. Automatic ACME issuance/renewal is available through Certbot HTTP-01 when `acme.enabled` is enabled. Certbot must be installed in the same runtime, the public domain must resolve to the proxy, and public TCP/80 must reach the challenge handler. See the README ACME setup instructions. This integration does not install Certbot or manage host-level permissions.
 
 Example private HTTP listener (recommended only on localhost or a trusted private network):
 
@@ -56,7 +56,7 @@ A self-signed certificate is suitable for a local test only and will show browse
 
 - HTTP sends credentials over the network without transport encryption. Use it only on localhost or a trusted network.
 - Changes to the listener and TLS configuration require a full Velocity restart. The web interface reports this requirement after saving.
-- The maintenance flag is informational in this version; it does not block Minecraft logins.
+- Maintenance mode can deny new Velocity logins when enabled. UUID whitelist enforcement is configurable; test it on a staging proxy before enabling it on a production network.
 - Do not treat the current plugin as tested for public production use until the shaded JAR is built with the target JDK and tested on a real Velocity proxy.
 
 ## External integrations and API keys
@@ -73,4 +73,4 @@ Set `discord.enabled: true` and `discord.webhook-url` to an official HTTPS Disco
 
 ## Security controls not yet available
 
-TOTP-based two-factor authentication is now included in the source: enroll from Security Center, confirm a six-digit code, and use the code after password entry at login. Disabling TOTP requires the current password and code. There are no recovery codes yet; keep access to your authenticator and secure the plugin SQLite database, which stores the TOTP secret. Before public production use, review the role matrix, run dependency/security scans, and exercise login, session revocation, TOTP and API-key revocation on a staging proxy.
+TOTP-based two-factor authentication is now included in the source: enroll from Security Center, confirm a six-digit code, and use the code after password entry at login. Disabling TOTP requires the current password and code. Recovery codes are not implemented in this release. Keep access to your authenticator; if it is lost, an operator with filesystem/database access may need to perform a carefully backed-up administrative recovery. The plugin SQLite database stores the TOTP secret, so protect the plugin data directory and its backups. Before public production use, review the role matrix, run dependency/security scans, and exercise login, session revocation, TOTP and API-key revocation on a staging proxy.

@@ -17,6 +17,11 @@ import fr.vertexvelocity.webpanel.db.PanelDatabase;
 import fr.vertexvelocity.webpanel.db.PanelDatabase.UserRecord;
 import fr.vertexvelocity.webpanel.security.PasswordUtil;
 import fr.vertexvelocity.webpanel.security.Totp;
+import fr.vertexvelocity.webpanel.service.MaintenanceService;
+import fr.vertexvelocity.webpanel.service.MotdService;
+import fr.vertexvelocity.webpanel.service.TlsCertificateDetector;
+import fr.vertexvelocity.webpanel.service.AcmeCertificateService;
+import fr.vertexvelocity.webpanel.commands.CommandAliasService;
 
 import java.io.*;
 import java.net.*;
@@ -33,39 +38,68 @@ public final class WebPanelServer {
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
     private final Map<String, PendingLogin> pendingLogins = new ConcurrentHashMap<>();
     private final Map<String, ArrayDeque<Long>> loginAttempts = new ConcurrentHashMap<>();
-    private final List<ConfigurableApplicationContext> springContexts = new CopyOnWriteArrayList<>();
+    private final Map<String, FailureState> failedLogins = new ConcurrentHashMap<>();
+    private volatile String lastAcmeError = "No ACME error recorded";
+    private volatile String lastAcmeCheck = "Not checked yet";
+    private volatile String lastCertificateFingerprint = "";
+    private final Map<Boolean, ConfigurableApplicationContext> springContexts = new ConcurrentHashMap<>();
+    private AcmeCertificateService acme;
     private final AtomicInteger httpErrors = new AtomicInteger();
-    private volatile boolean maintenanceEnabled;
-    private volatile String maintenanceMessage = "The network is under maintenance.";
+    private final MaintenanceService maintenance;
+    private final MotdService motd;
+    private final CommandAliasService aliases;
     private final Map<String, BackendHealth> backendHealth = new ConcurrentHashMap<>();
+    private Path effectiveKeystore;
+    private volatile TlsCertificateDetector.Material tlsMaterial;
+    private String activeMode = "HTTP";
 
-    public WebPanelServer(ProxyServer proxy, Logger logger, PanelConfig config, PanelDatabase db, Instant startedAt, Path dataDirectory) { this.proxy=proxy;this.logger=logger;this.config=config;this.db=db;this.startedAt=startedAt;this.dataDirectory=dataDirectory; }
+    public WebPanelServer(ProxyServer proxy, Logger logger, PanelConfig config, PanelDatabase db, Instant startedAt, Path dataDirectory, MaintenanceService maintenance, MotdService motd, CommandAliasService aliases) throws IOException { this.proxy=proxy;this.logger=logger;this.config=config;this.db=db;this.startedAt=startedAt;this.dataDirectory=dataDirectory; this.maintenance = maintenance; this.motd = motd; this.aliases = aliases; }
 
     public void start() throws Exception {
         if (!config.webEnabled()) { logger.info("Web panel is disabled in config.yml"); return; }
-        String mode = config.webMode();
-        if (!Set.of("HTTP", "HTTPS", "BOTH").contains(mode)) {
-            throw new IllegalStateException("web-panel.mode must be HTTP, HTTPS or BOTH");
-        }
-        if ((mode.equals("HTTPS") || mode.equals("BOTH")) && !config.httpsEnabled()) {
-            throw new IllegalStateException("HTTPS requested but web-panel.https.enabled is false");
-        }
-        if (mode.equals("HTTPS") || mode.equals("BOTH")) {
-            validateKeystore();
-        }
-        try {
+        String requestedMode = config.webMode();
+        if (!Set.of("AUTO", "HTTP", "HTTPS", "BOTH").contains(requestedMode)) throw new IllegalStateException("web-panel.mode must be AUTO, HTTP, HTTPS or BOTH");
+        TlsCertificateDetector detector = new TlsCertificateDetector(dataDirectory);
+        if (config.acmeEnabled()) {
+            acme = new AcmeCertificateService(config, logger, dataDirectory);
+            acme.validateConfiguration();
+            // HTTP-01 validation needs a live HTTP listener before Certbot can request the challenge URL.
+            activeMode = "HTTP";
             PanelWebApplication.setDelegate(this);
-            if (mode.equals("HTTP") || mode.equals("BOTH")) {
-                startSpringContext(false);
+            startSpringContext(false);
+            int hours = Math.max(6, Math.min(168, config.acmeRenewalCheckHours()));
+            proxy.getScheduler().buildTask(getPluginOwner(), this::checkAcmeRenewal)
+                    .repeat(hours, TimeUnit.HOURS).schedule();
+            logger.info("Automatic ACME enabled for {}. HTTP-01 challenges served from {}; issuance/renewal checked every {} hours.",
+                    config.acmeDomain(), acme.challengeRoot(), hours);
+            // Do not block Velocity's proxy-initialization thread while Certbot performs network validation.
+            Thread initialAcme = new Thread(this::checkAcmeRenewal, "vertex-acme-initial-issuance");
+            initialAcme.setDaemon(true);
+            initialAcme.start();
+        } else {
+            if (!requestedMode.equals("HTTP")) tlsMaterial = detector.detect(config.keystore(), config.keystoreType(), config.keystorePassword(), config.certificate(), config.privateKey()).orElse(null);
+            if (requestedMode.equals("AUTO")) {
+                activeMode = tlsMaterial == null ? "HTTP" : "HTTPS";
+                if (tlsMaterial == null) logger.warn("TLS auto-detection found no usable certificate/private-key pair or keystore. Starting HTTP on port {}. Place fullchain.pem + privkey.pem in the plugin tls/ directory to enable HTTPS automatically.", config.httpPort());
+                else logger.info("TLS auto-detection found a valid certificate (subject={}, expires={}); selecting HTTPS automatically.", tlsMaterial.subject(), tlsMaterial.expiresAt());
+            } else {
+                activeMode = requestedMode;
+                if ((requestedMode.equals("HTTPS") || requestedMode.equals("BOTH")) && tlsMaterial == null) throw new IllegalStateException("HTTPS was explicitly requested but no valid TLS certificate/key pair or usable keystore was detected. Put fullchain.pem + privkey.pem in the plugin tls/ folder or use AUTO mode.");
             }
-            if (mode.equals("HTTPS")) {
-                startSpringContext(true);
-            } else if (mode.equals("BOTH")) {
-                startSpringContext(true);
+            if (activeMode.equals("BOTH") && config.httpPort() == config.httpsPort()) throw new IllegalStateException("HTTP and HTTPS ports must differ in BOTH mode");
+            try {
+                PanelWebApplication.setDelegate(this);
+                if (activeMode.equals("HTTP") || activeMode.equals("BOTH")) startSpringContext(false);
+                if (activeMode.equals("HTTPS") || activeMode.equals("BOTH")) startSpringContext(true);
+            } catch (Exception e) {
+                stop();
+                if (requestedMode.equals("AUTO") && tlsMaterial != null) {
+                    logger.warn("TLS material was discovered but HTTPS could not start. Falling back to HTTP on port {}. Check certificate/key matching, permissions and certificate chain.", config.httpPort(), e);
+                    activeMode = "HTTP";
+                    PanelWebApplication.setDelegate(this);
+                    startSpringContext(false);
+                } else throw e;
             }
-        } catch (Exception e) {
-            stop();
-            throw e;
         }
         if (springContexts.isEmpty()) throw new IllegalStateException("No Spring Boot web listener started.");
         long interval = Math.max(5, config.sampleSeconds());
@@ -76,12 +110,47 @@ public final class WebPanelServer {
         }).repeat(interval, TimeUnit.SECONDS).schedule();
     }
 
-    private void validateKeystore() throws Exception {
-        String path = config.keystore();
-        if (path.isBlank()) throw new IllegalStateException("HTTPS keystore path is empty");
-        java.security.KeyStore keyStore = java.security.KeyStore.getInstance(config.keystoreType());
-        try (InputStream input = Files.newInputStream(Path.of(path))) {
-            keyStore.load(input, config.keystorePassword().toCharArray());
+    private synchronized void checkAcmeRenewal() {
+        if (acme == null) return;
+        try {
+            boolean operationOk = tlsMaterial == null ? acme.obtainInitialCertificate() : acme.renew();
+            lastAcmeCheck = Instant.now().toString();
+            if (!operationOk) lastAcmeError = "Certbot did not complete successfully; see the private ACME log files."; else lastAcmeError = "";
+            if (!operationOk) return;
+            TlsCertificateDetector detector = new TlsCertificateDetector(dataDirectory);
+            Optional<TlsCertificateDetector.Material> renewed = detector.detectPemPair(acme.certificatePath(), acme.privateKeyPath());
+            if (renewed.isEmpty()) {
+                logger.error("Certbot completed, but the configured ACME certificate could not be loaded. Keeping the currently running HTTPS listener.");
+                return;
+            }
+            TlsCertificateDetector.Material next = renewed.get();
+            boolean changed = tlsMaterial == null || !next.expiresAt().equals(tlsMaterial.expiresAt()) || !certificateFingerprint(next).equals(lastCertificateFingerprint);
+            lastCertificateFingerprint = certificateFingerprint(next);
+            if (!changed) return;
+            TlsCertificateDetector.Material previous = tlsMaterial;
+            ConfigurableApplicationContext old = springContexts.remove(true);
+            if (old != null) old.close();
+            tlsMaterial = next;
+            try {
+                startSpringContext(true);
+                activeMode = springContexts.containsKey(false) ? "BOTH" : "HTTPS";
+                logger.info("HTTPS listener loaded/reloaded with the ACME certificate (expires {}).", next.expiresAt());
+            } catch (Exception reloadFailure) {
+                tlsMaterial = previous;
+                logger.error("Could not start HTTPS with the renewed certificate; attempting to restore the previous HTTPS listener.", reloadFailure);
+                if (previous != null) {
+                    try {
+                        startSpringContext(true);
+                        activeMode = springContexts.containsKey(false) ? "BOTH" : "HTTPS";
+                        logger.warn("Previous HTTPS certificate listener restored (expires {}).", previous.expiresAt());
+                    } catch (Exception restoreFailure) {
+                        logger.error("Could not restore the previous HTTPS listener. HTTP may remain available if configured.", restoreFailure);
+                    }
+                }
+            }
+        } catch (Exception error) {
+            lastAcmeCheck = Instant.now().toString(); lastAcmeError = error.getClass().getSimpleName()+": "+String.valueOf(error.getMessage());
+            logger.error("Automatic ACME issuance/renewal/reload failed. Detailed error is available in TLS status; inspect private Certbot logs for more information.", error);
         }
     }
 
@@ -101,9 +170,15 @@ public final class WebPanelServer {
         properties.put("server.max-http-request-header-size", "16KB");
         properties.put("logging.level.root", "WARN");
         if (https) {
-            properties.put("server.ssl.key-store", Path.of(config.keystore()).toAbsolutePath().toString());
-            properties.put("server.ssl.key-store-password", config.keystorePassword());
-            properties.put("server.ssl.key-store-type", config.keystoreType());
+            if (tlsMaterial == null) throw new IllegalStateException("HTTPS listener requested without detected TLS material");
+            if (tlsMaterial.kind() == TlsCertificateDetector.Material.Kind.PEM) {
+                properties.put("server.ssl.certificate", tlsMaterial.certificate().toString());
+                properties.put("server.ssl.certificate-private-key", tlsMaterial.privateKey().toString());
+            } else {
+                properties.put("server.ssl.key-store", tlsMaterial.keyStore().toString());
+                if (tlsMaterial.keyStorePassword() != null && !tlsMaterial.keyStorePassword().isEmpty()) properties.put("server.ssl.key-store-password", tlsMaterial.keyStorePassword());
+                properties.put("server.ssl.key-store-type", tlsMaterial.keyStoreType());
+            }
             properties.put("server.ssl.enabled-protocols", "TLSv1.3,TLSv1.2");
         }
         ConfigurableApplicationContext context = new SpringApplicationBuilder(PanelWebApplication.class)
@@ -111,7 +186,7 @@ public final class WebPanelServer {
                 .registerShutdownHook(false)
                 .properties(properties)
                 .run();
-        springContexts.add(context);
+        springContexts.put(https, context);
         logger.info("Vertex Web Panel Spring Boot {} listener started on {}:{}",
                 https ? "HTTPS" : "HTTP", config.bindAddress(), port);
     }
@@ -127,9 +202,20 @@ public final class WebPanelServer {
     private void handle(HttpExchange x) throws IOException {
         try {
             addSecurityHeaders(x); String path=x.getRequestURI().getPath(); String method=x.getRequestMethod().toUpperCase(Locale.ROOT);
+            if (hasSessionCookie(x) && !Set.of("GET", "HEAD", "OPTIONS").contains(method) && !csrfOriginAllowed(x)) { json(x, 403, Map.of("error", "CSRF validation failed: Origin must match this panel host.")); return; }
+            if (acme != null && !x.getRequestMethod().equalsIgnoreCase("HEAD")) {
+                Optional<byte[]> challenge = acme.challenge(path);
+                if (challenge.isPresent()) {
+                    byte[] body = challenge.get();
+                    x.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
+                    x.getResponseHeaders().set("Cache-Control", "no-store");
+                    if (body.length == 0) { x.sendResponseHeaders(404, -1); return; }
+                    x.sendResponseHeaders(200, body.length); try (OutputStream out = x.getResponseBody()) { out.write(body); } return;
+                }
+            }
             if(path.equals("/")||path.equals("/index.html")){serveResource(x,"/web/index.html","text/html; charset=utf-8");return;}
             if(path.startsWith("/assets/")){serveResource(x,"/web"+path,"text/plain; charset=utf-8");return;}
-            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","2.0.0","timestamp",Instant.now().getEpochSecond()));return;}
+            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","2.1.1","timestamp",Instant.now().getEpochSecond()));return;}
             if(path.equals("/api/v1/setup-status")&&method.equals("GET")){json(x,200,Map.of("needsSetup",db.userCount()==0));return;}
             if(path.equals("/api/v1/setup")&&method.equals("POST")){setup(x);return;}
             if(path.equals("/api/v1/login")&&method.equals("POST")){login(x);return;}
@@ -140,15 +226,20 @@ public final class WebPanelServer {
             if(path.startsWith("/api/v1/integrations/keys/")&&method.equals("DELETE")) { Session owner=authenticate(x); if(owner==null){json(x,401,Map.of("error","Authentication required"));return;} requireOwner(x,owner); revokeApiKey(x,owner,path); return; }
             Session session=authenticate(x);
             if(session==null){json(x,401,Map.of("error","Authentication required"));return;}
-            if(session.apiKey && !method.equals("GET")){json(x,403,Map.of("error","API keys are read-only"));return;}
+            if(session.apiKey && !method.equals("GET") && !session.apiWrite){json(x,403,Map.of("error","This API key has READ scope only"));return;}
+            if (!session.apiKey && !Set.of("GET","HEAD","OPTIONS").contains(method) && !Set.of("OWNER","ADMINISTRATOR").contains(session.role) && !path.equals("/api/v1/logout")) { json(x,403,Map.of("error","Insufficient role permissions")); return; }
+            if(path.equals("/api/v1/status")&&method.equals("GET")){Map<String,Object> state=new LinkedHashMap<>();state.put("ok",true);state.put("stats",stats());state.put("maintenance",maintenance.view());state.put("motd",motd.view());state.put("tls",tlsStatus());state.put("servers",proxy.getAllServers().size());json(x,200,state);return;}
+            if(path.equals("/api/v1/tls")&&method.equals("GET")){json(x,200,tlsStatus());return;}
             if(path.equals("/api/v1/2fa")&&method.equals("GET")){json(x,200,Map.of("enabled",db.totpEnabled(session.username)));return;}
             if(path.equals("/api/v1/2fa/setup")&&method.equals("POST")){String secret=Totp.newBase32Secret();db.createPendingTotp(session.username,secret);db.audit(session.username,"TOTP_SETUP_STARTED",session.username,clientIp(x),"Pending TOTP secret created");json(x,200,Map.of("secret",secret,"otpauthUri",Totp.uri(session.username,secret),"message","Add this account to your authenticator app, then confirm with a current six-digit code."));return;}
-            if(path.equals("/api/v1/2fa/enable")&&method.equals("POST")){Map<?,?> b=body(x);String secret=db.pendingTotpSecret(session.username);if(secret==null||!Totp.verify(secret,string(b,"code",""))){json(x,400,Map.of("error","Invalid code or no pending setup. Start setup again."));return;}db.enableTotp(session.username);db.audit(session.username,"TOTP_ENABLED",session.username,clientIp(x),"TOTP enabled");json(x,200,Map.of("ok",true,"enabled",true));return;}
+            if(path.equals("/api/v1/2fa/enable")&&method.equals("POST")){Map<?,?> b=body(x);String secret=db.pendingTotpSecret(session.username);if(secret==null||!Totp.verify(secret,string(b,"code",""))){json(x,400,Map.of("error","Invalid code or no pending setup. Start setup again."));return;}List<String> recoveryCodes=new ArrayList<>();List<String> recoveryHashes=new ArrayList<>();for(int i=0;i<10;i++){String recovery=java.util.UUID.randomUUID().toString().replace("-", "").substring(0,16).toUpperCase(Locale.ROOT);recoveryCodes.add(recovery.substring(0,4)+"-"+recovery.substring(4,8)+"-"+recovery.substring(8,12)+"-"+recovery.substring(12));recoveryHashes.add(PanelDatabase.hashApiKey(recovery));}db.enableTotp(session.username,recoveryHashes);db.audit(session.username,"TOTP_ENABLED",session.username,clientIp(x),"TOTP enabled; 10 one-time recovery codes generated");json(x,200,Map.of("ok",true,"enabled",true,"recoveryCodes",recoveryCodes,"warning","Save these recovery codes now. They are shown only once; each code can be used once."));return;}
             if(path.equals("/api/v1/2fa/disable")&&method.equals("POST")){Map<?,?> b=body(x);Optional<UserRecord> u=db.findUser(session.username);String password=string(b,"password","");String code=string(b,"code","");String secret=db.totpSecret(session.username);if(u.isEmpty()||!PasswordUtil.verify(password,u.get().salt(),u.get().passwordHash())||secret==null||!Totp.verify(secret,code)){json(x,400,Map.of("error","Password or authenticator code is invalid"));return;}db.disableTotp(session.username);db.audit(session.username,"TOTP_DISABLED",session.username,clientIp(x),"TOTP disabled");json(x,200,Map.of("ok",true,"enabled",false));return;}
             if(path.equals("/api/v1/integrations/keys")&&method.equals("GET")){requireOwner(x,session);json(x,200,db.apiKeys());return;}
             if(path.equals("/api/v1/integrations/keys")&&method.equals("POST")){requireOwner(x,session);createApiKey(x,session);return;}
             if(path.startsWith("/api/v1/integrations/keys/")&&method.equals("DELETE")){requireOwner(x,session);revokeApiKey(x,session,path);return;}
             if(path.equals("/api/v1/me")&&method.equals("GET")){json(x,200,Map.of("username",session.username,"role",session.role,"expiresAt",session.expiresAt));return;}
+            if(path.equals("/api/v1/sessions/revoke-all")&&method.equals("POST")){requireOwner(x,session);int count=sessions.size();sessions.clear();db.audit(session.username,"ALL_SESSIONS_REVOKED",null,clientIp(x),"Globally revoked "+count+" web sessions");x.getResponseHeaders().add("Set-Cookie",sessionCookie("",0,x));json(x,200,Map.of("ok",true,"revoked",count,"message","All web sessions were revoked. Sign in again."));return;}
+            if(path.equals("/api/v1/session/rotate")&&method.equals("POST")){if(session.apiKey){json(x,400,Map.of("error","Session rotation is only available to browser sessions"));return;}String old=cookie(x,"vv_session");if(old!=null)sessions.remove(old);String next=randomToken();long expiry=Instant.now().getEpochSecond()+config.sessionMinutes()*60L;sessions.put(next,new Session(session.username,session.role,expiry,false,false));x.getResponseHeaders().add("Set-Cookie",sessionCookie(next,config.sessionMinutes()*60,x));db.audit(session.username,"SESSION_ROTATED",null,clientIp(x),"Browser session token rotated");json(x,200,Map.of("ok",true,"expiresAt",expiry,"message","Session token rotated."));return;}
             if(path.equals("/api/v1/sessions")&&method.equals("GET")){requireOwner(x,session);List<Map<String,Object>> active=new ArrayList<>();for(Map.Entry<String,Session> entry:sessions.entrySet()){Session value=entry.getValue();Map<String,Object> item=new LinkedHashMap<>();try{item.put("id",PanelDatabase.hashApiKey(entry.getKey()).substring(0,16));}catch(Exception ignored){}item.put("username",value.username);item.put("role",value.role);item.put("expiresAt",value.expiresAt);item.put("current",value.username.equals(session.username)&&value.expiresAt==session.expiresAt);active.add(item);}json(x,200,active);return;}
             if(path.startsWith("/api/v1/sessions/")&&method.equals("DELETE")){requireOwner(x,session);String id=path.substring("/api/v1/sessions/".length());boolean removed=false;for(Map.Entry<String,Session> entry:sessions.entrySet()){try{if(PanelDatabase.hashApiKey(entry.getKey()).startsWith(id)&&id.matches("[a-f0-9]{16}")){if(sessions.remove(entry.getKey(),entry.getValue()))removed=true;}}catch(Exception ignored){}}if(!removed){json(x,404,Map.of("error","Session not found"));return;}db.audit(session.username,"SESSION_REVOKED",id,clientIp(x),"Web session revoked");json(x,200,Map.of("ok",true));return;}
             if(path.equals("/api/v1/stats")&&method.equals("GET")){json(x,200,stats());return;}
@@ -178,12 +269,42 @@ public final class WebPanelServer {
             if(path.equals("/api/v1/users")&&method.equals("GET")){requireRole(x,session,"OWNER");json(x,200,db.users());return;}
             if(path.equals("/api/v1/users")&&method.equals("POST")){requireOwner(x,session);createUser(x,session);return;}
             if(path.startsWith("/api/v1/users/")&&method.equals("POST")){requireOwner(x,session);disableUser(x,session,path);return;}
-            if(path.equals("/api/v1/maintenance")&&method.equals("GET")){json(x,200,Map.of("enabled",maintenanceEnabled,"message",maintenanceMessage));return;}
-            if(path.equals("/api/v1/maintenance")&&method.equals("PUT")){requireRole(x,session,"OWNER","ADMINISTRATOR");setMaintenance(x,session);return;}
+            if(path.equals("/api/v1/motd")&&method.equals("GET")){json(x,200,motd.view());return;}
+            if(path.equals("/api/v1/motd/preview")&&method.equals("GET")){Map<String,Object> preview=new LinkedHashMap<>(motd.view());preview.put("maintenanceActive",maintenance.enabled());preview.put("effectiveProfile",maintenance.enabled()?"maintenance":"normal");json(x,200,preview);return;}
+            if(path.equals("/api/v1/aliases")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR");json(x,200,aliases.view());return;}
+            if(path.equals("/api/v1/aliases")&&method.equals("PUT")){requireRole(x,session,"OWNER");int count=aliases.update(body(x));db.audit(session.username,"ALIASES_UPDATED",null,clientIp(x),"Registered aliases="+count);json(x,200,Map.of("ok",true,"registered",count,"aliases",aliases.view()));return;}
+            if(path.equals("/api/v1/aliases/reload")&&method.equals("POST")){requireWriteAdmin(x,session);int count=aliases.reload();db.audit(session.username,"ALIASES_RELOADED",null,clientIp(x),"Registered aliases="+count);json(x,200,Map.of("ok",true,"registered",count));return;}
+            if(path.equals("/api/v1/motd")&&method.equals("PUT")){requireWriteAdmin(x,session);motd.update(body(x));db.audit(session.username,"MOTD_UPDATED",null,clientIp(x),"MOTD configuration changed");json(x,200,Map.of("ok",true,"motd",motd.view()));return;}
+            if(path.equals("/api/v1/maintenance")&&method.equals("GET")){json(x,200,maintenance.view());return;}
+            if(path.equals("/api/v1/maintenance/status")&&method.equals("GET")){Map<String,Object> status=new LinkedHashMap<>(maintenance.view());status.put("onlinePlayers",proxy.getPlayerCount());status.put("whitelistedOnlinePlayers",proxy.getAllPlayers().stream().filter(p->maintenance.isWhitelisted(p.getUniqueId().toString())).count());status.put("effectiveMotdProfile",maintenance.enabled()?"maintenance":"normal");json(x,200,status);return;}
+            if(path.equals("/api/v1/maintenance")&&method.equals("PUT")){requireWriteAdmin(x,session);setMaintenance(x,session);return;}
+            if(path.equals("/api/v1/maintenance/whitelist") && method.equals("POST")) {
+                requireWriteAdmin(x,session);
+                Map<?,?> request = body(x); String uuid = string(request,"uuid","").trim(); String playerName = string(request,"playerName","").trim();
+                if (uuid.isBlank() && !playerName.isBlank()) {
+                    Optional<Player> online = proxy.getPlayer(playerName);
+                    if (online.isPresent()) uuid = online.get().getUniqueId().toString();
+                    else { json(x,404,Map.of("error","Player is not online. Provide a UUID for offline players.")); return; }
+                }
+                try { boolean changed = maintenance.add(uuid); kickPlayersNotAllowedByMaintenance(); db.audit(session.username,"MAINTENANCE_WHITELIST_ADD",uuid,clientIp(x),"changed="+changed); json(x,200,Map.of("ok",true,"changed",changed,"maintenance",maintenance.view())); }
+                catch (IllegalArgumentException invalidUuid) { json(x,400,Map.of("error",invalidUuid.getMessage())); }
+                return;
+            }
+            if(path.startsWith("/api/v1/maintenance/whitelist/") && (method.equals("POST") || method.equals("DELETE"))) {
+                requireWriteAdmin(x,session);
+                String uuid = URLDecoder.decode(path.substring("/api/v1/maintenance/whitelist/".length()), StandardCharsets.UTF_8);
+                try {
+                    boolean changed = method.equals("POST") ? maintenance.add(uuid) : maintenance.remove(uuid);
+                    kickPlayersNotAllowedByMaintenance();
+                    db.audit(session.username, method.equals("POST") ? "MAINTENANCE_WHITELIST_ADD" : "MAINTENANCE_WHITELIST_REMOVE", uuid, clientIp(x), "changed="+changed);
+                    json(x, 200, Map.of("ok",true,"changed",changed,"maintenance",maintenance.view()));
+                } catch (IllegalArgumentException invalidUuid) { json(x,400,Map.of("error",invalidUuid.getMessage())); }
+                return;
+            }
             json(x,404,Map.of("error","Not found"));
         } catch (ForbiddenException e) { safeJson(x,403,Map.of("error","Insufficient permissions")); }
         catch (IllegalArgumentException e) { safeJson(x,400,Map.of("error",e.getMessage()==null?"Invalid request":e.getMessage())); }
-        catch (Exception e) { httpErrors.incrementAndGet(); logger.warn("Web panel request failed: {} {}",x.getRequestMethod(),x.getRequestURI(),e); safeJson(x,500,Map.of("error","Internal server error")); }
+        catch (Exception e) { httpErrors.incrementAndGet(); logger.warn("Web panel request failed: {} {}",x.getRequestMethod(),x.getRequestURI().getPath(),e); safeJson(x,500,Map.of("error","Internal server error")); }
         finally { x.close(); }
     }
 
@@ -196,36 +317,43 @@ public final class WebPanelServer {
         db.audit(username,"OWNER_CREATED",username,clientIp(x),"Initial owner created");json(x,201,Map.of("ok",true,"message","Owner created. Sign in now."));
     }
     private void login(HttpExchange x) throws Exception {
-        String ip=clientIp(x); if(!allowAttempt(ip)){json(x,429,Map.of("error","Too many login attempts. Try again shortly."));return;}
+        String ip=clientIp(x); if(!allowAttempt(ip)){json(x,429,Map.of("error","Too many login attempts. Try again later."));return;} if (isProgressivelyBlocked(ip)) { json(x,429,Map.of("error","Login temporarily blocked after repeated failures.","retryAfterSeconds",retryAfter(ip))); return; }
         Map<?,?> body=body(x);String username=string(body,"username","");String password=string(body,"password","");
         Optional<UserRecord> found=db.findUser(username);
-        if(found.isEmpty()||found.get().disabled()||!PasswordUtil.verify(password,found.get().salt(),found.get().passwordHash())){db.audit(username,"LOGIN_FAILED",null,ip,"Invalid credentials");json(x,401,Map.of("error","Invalid username or password"));return;}
-        UserRecord user=found.get();
+        if(found.isEmpty()||found.get().disabled()||!PasswordUtil.verify(password,found.get().salt(),found.get().passwordHash())){recordFailedLogin(ip);db.audit(username,"LOGIN_FAILED",null,ip,"Invalid credentials");json(x,401,Map.of("error","Invalid username or password"));return;}
+        failedLogins.remove(ip); UserRecord user=found.get();
         if(db.totpEnabled(user.username())){long now=Instant.now().getEpochSecond();pendingLogins.entrySet().removeIf(e->e.getValue().expiresAt<now);String challenge=randomToken();pendingLogins.put(challenge,new PendingLogin(user.username(),user.role(),now+300));json(x,202,Map.of("requiresTotp",true,"challengeId",challenge,"message","Enter the six-digit code from your authenticator app."));return;}
         createSession(x,user.username(),user.role(),ip);
     }
     private void completeTotpLogin(HttpExchange x) throws Exception {
-        String ip=clientIp(x);if(!allowAttempt(ip)){json(x,429,Map.of("error","Too many login attempts. Try again shortly."));return;}
+        String ip=clientIp(x);if(!allowAttempt(ip)){json(x,429,Map.of("error","Too many login attempts. Try again later."));return;} if (isProgressivelyBlocked(ip)) { json(x,429,Map.of("error","Login temporarily blocked after repeated failures.","retryAfterSeconds",retryAfter(ip))); return; }
         Map<?,?> b=body(x);String id=string(b,"challengeId","");String code=string(b,"code","");PendingLogin pending=pendingLogins.get(id);
         if(pending==null||pending.expiresAt<Instant.now().getEpochSecond()){pendingLogins.remove(id);json(x,401,Map.of("error","Authentication challenge expired. Sign in again."));return;}
-        String secret=db.totpSecret(pending.username);if(secret==null||!Totp.verify(secret,code)){db.audit(pending.username,"LOGIN_2FA_FAILED",null,ip,"Invalid TOTP code");json(x,400,Map.of("error","Invalid authenticator code"));return;}
+        String secret=db.totpSecret(pending.username);boolean valid=secret!=null&&Totp.verify(secret,code);if(!valid&&code!=null){String normalized=code.replace("-", "").replace(" ", "").toUpperCase(Locale.ROOT);if(normalized.matches("[A-F0-9]{16}")){valid=db.consumeTotpRecoveryCode(pending.username,PanelDatabase.hashApiKey(normalized));if(valid)db.audit(pending.username,"TOTP_RECOVERY_USED",pending.username,ip,"One-time TOTP recovery code consumed");}}if(!valid){recordFailedLogin(ip);db.audit(pending.username,"LOGIN_2FA_FAILED",null,ip,"Invalid TOTP or recovery code");json(x,401,Map.of("error","Invalid authenticator or recovery code"));return;}
+        failedLogins.remove(ip);
         pendingLogins.remove(id);createSession(x,pending.username,pending.role,ip);
     }
     private void createSession(HttpExchange x,String username,String role,String ip) throws Exception {
-        String token=randomToken();long expiry=Instant.now().getEpochSecond()+config.sessionMinutes()*60L;sessions.put(token,new Session(username,role,expiry,false));
-        db.audit(username,"LOGIN_SUCCESS",null,ip,"Web panel login");x.getResponseHeaders().add("Set-Cookie","vv_session="+token+"; Path=/; HttpOnly; SameSite=Strict"+(x instanceof HttpsExchange?"; Secure":"")+"; Max-Age="+(config.sessionMinutes()*60));json(x,200,Map.of("ok",true,"username",username,"role",role,"expiresAt",expiry));
+        String token=randomToken();long expiry=Instant.now().getEpochSecond()+config.sessionMinutes()*60L;sessions.put(token,new Session(username,role,expiry,false,false));
+        db.audit(username,"LOGIN_SUCCESS",null,ip,"Web panel login");x.getResponseHeaders().add("Set-Cookie",sessionCookie(token,config.sessionMinutes()*60,x));json(x,200,Map.of("ok",true,"username",username,"role",role,"expiresAt",expiry));
     }
-    private void logout(HttpExchange x) throws IOException {String token=cookie(x,"vv_session");if(token!=null){Session s=sessions.remove(token);if(s!=null)db.audit(s.username,"LOGOUT",null,clientIp(x),"Web panel logout");}x.getResponseHeaders().add("Set-Cookie","vv_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");json(x,200,Map.of("ok",true));}
+    private String sessionCookie(String token,long maxAge,HttpExchange x){boolean secure=(x instanceof HttpsExchange)||config.reverseProxyMode();return "vv_session="+token+"; Path=/; HttpOnly; SameSite=Strict"+(secure?"; Secure":"")+"; Max-Age="+maxAge;}
+    private void logout(HttpExchange x) throws IOException {String token=cookie(x,"vv_session");if(token!=null){Session s=sessions.remove(token);if(s!=null)db.audit(s.username,"LOGOUT",null,clientIp(x),"Web panel logout");}x.getResponseHeaders().add("Set-Cookie",sessionCookie("",0,x));json(x,200,Map.of("ok",true));}
     private Session authenticate(HttpExchange x){
         String authorization=x.getRequestHeaders().getFirst("Authorization");
         if(authorization!=null && authorization.startsWith("Bearer ")){
             String key=authorization.substring(7).trim();
-            if(key.startsWith("vv_live_") && key.length()>=40) try { if(db.authenticateApiKey(PanelDatabase.hashApiKey(key))) return new Session("api-key","VIEWER",Long.MAX_VALUE,true); } catch(Exception ignored) {}
+            if(key.startsWith("vv_live_") && key.length()>=40) try { String scope=db.authenticateApiKeyScope(PanelDatabase.hashApiKey(key)); if(scope!=null) { boolean write=scope.equals("READ_WRITE"); return new Session("api-key",write?"ADMINISTRATOR":"VIEWER",Long.MAX_VALUE,true,write); } } catch(Exception ignored) {}
             return null;
         }
         String token=cookie(x,"vv_session");if(token==null)return null;Session s=sessions.get(token);if(s==null)return null;if(s.expiresAt<Instant.now().getEpochSecond()){sessions.remove(token);return null;}return s;
     }
-    private boolean allowAttempt(String ip){long now=System.currentTimeMillis();ArrayDeque<Long> q=loginAttempts.computeIfAbsent(ip,k->new ArrayDeque<>());synchronized(q){while(!q.isEmpty()&&now-q.peekFirst()>60_000)q.removeFirst();if(q.size()>=config.loginAttemptsPerMinute())return false;q.addLast(now);return true;}}
+    private boolean allowAttempt(String ip){long now=System.currentTimeMillis();ArrayDeque<Long> q=loginAttempts.computeIfAbsent(ip,k->new ArrayDeque<>());synchronized(q){while(!q.isEmpty()&&now-q.peekFirst()>60_000)q.removeFirst();if(q.size()>=Math.max(3,Math.min(60,config.loginAttemptsPerMinute())))return false;q.addLast(now);return true;}}
+    private void recordFailedLogin(String ip) { failedLogins.compute(ip,(k,v)-> { long now=System.currentTimeMillis(); if(v==null||now-v.lastFailure>900_000L) v=new FailureState(0,0,now); int n=v.failures+1; long delay=n<5?0:Math.min(900_000L,30_000L << Math.min(4,(n-5)/2)); return new FailureState(n,Math.max(v.blockedUntil,now+delay),now); }); }
+    private boolean isProgressivelyBlocked(String ip) { FailureState s=failedLogins.get(ip); if(s==null)return false; if(System.currentTimeMillis()-s.lastFailure>900_000L){failedLogins.remove(ip,s);return false;} return s.blockedUntil>System.currentTimeMillis(); }
+    private long retryAfter(String ip) { FailureState s=failedLogins.get(ip);return s==null?0:Math.max(1,(s.blockedUntil-System.currentTimeMillis()+999)/1000); }
+    private boolean hasSessionCookie(HttpExchange x) { return cookie(x,"vv_session") != null; }
+    private boolean csrfOriginAllowed(HttpExchange x) { String origin=x.getRequestHeaders().getFirst("Origin"), host=x.getRequestHeaders().getFirst("Host"); if(origin==null||host==null)return false; try { URI u=URI.create(origin); return u.getHost()!=null && host.equalsIgnoreCase(u.getRawAuthority()) && ("http".equalsIgnoreCase(u.getScheme())||"https".equalsIgnoreCase(u.getScheme())); } catch(Exception e){return false;} }
 
     private Path velocityTomlPath() { Path p=dataDirectory.toAbsolutePath();Path plugins=p.getParent();Path root=plugins==null?null:plugins.getParent();return root==null?p.resolve("velocity.toml"):root.resolve("velocity.toml"); }
     private Map<String,Object> readRouting() throws IOException {
@@ -545,7 +673,7 @@ public final class WebPanelServer {
     }
 
     private Map<String,Object> stats() throws Exception {
-        Map<String,Object> m=new LinkedHashMap<>();m.put("onlinePlayers",proxy.getPlayerCount());m.put("backendCount",proxy.getAllServers().size());m.put("uptimeSeconds",Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond()));m.put("startedAt",startedAt.getEpochSecond());m.put("jvmUsedBytes",Runtime.getRuntime().totalMemory()-Runtime.getRuntime().freeMemory());m.put("jvmTotalBytes",Runtime.getRuntime().totalMemory());m.put("jvmMaxBytes",Runtime.getRuntime().maxMemory());m.put("processors",Runtime.getRuntime().availableProcessors());m.put("httpErrors",httpErrors.get());m.put("maintenance",maintenanceEnabled);m.put("latestEvents",db.events(8));return m;
+        Map<String,Object> m=new LinkedHashMap<>();m.put("onlinePlayers",proxy.getPlayerCount());m.put("backendCount",proxy.getAllServers().size());m.put("uptimeSeconds",Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond()));m.put("startedAt",startedAt.getEpochSecond());m.put("jvmUsedBytes",Runtime.getRuntime().totalMemory()-Runtime.getRuntime().freeMemory());m.put("jvmTotalBytes",Runtime.getRuntime().totalMemory());m.put("jvmMaxBytes",Runtime.getRuntime().maxMemory());m.put("processors",Runtime.getRuntime().availableProcessors());m.put("httpErrors",httpErrors.get());m.put("maintenance",maintenance.enabled());m.put("latestEvents",db.events(8));return m;
     }
     private List<Map<String,Object>> players(Map<String,String> filters){List<Map<String,Object>> out=new ArrayList<>();String serverFilter=filters.getOrDefault("server","");String search=filters.getOrDefault("search","").toLowerCase(Locale.ROOT);int limit=Math.max(1,Math.min(500,queryIntFromMap(filters,"limit",100)));for(Player p:proxy.getAllPlayers()){String backend=p.getCurrentServer().map(s->s.getServerInfo().getName()).orElse("Connecting");if(!serverFilter.isBlank()&&!backend.equalsIgnoreCase(serverFilter))continue;if(!search.isBlank()&&!p.getUsername().toLowerCase(Locale.ROOT).contains(search))continue;Map<String,Object> m=new LinkedHashMap<>();m.put("username",p.getUsername());m.put("uuid",p.getUniqueId().toString());m.put("ping",p.getPing());m.put("server",backend);out.add(m);}out.sort(Comparator.comparing(m->String.valueOf(m.get("username")),String.CASE_INSENSITIVE_ORDER));return out.stream().limit(limit).toList();}
     private int queryIntFromMap(Map<String,String> values,String key,int fallback){try{return Integer.parseInt(values.getOrDefault(key,String.valueOf(fallback)));}catch(NumberFormatException e){return fallback;}}
@@ -616,20 +744,79 @@ public final class WebPanelServer {
         json(x,202,Map.of("ok",true,"message","Settings saved to config.yml. Listener, TLS, and bind changes require a proxy restart; data collection settings also take effect after restart.","restartRequired",true,"accepted",saved));
     }
     private void createApiKey(HttpExchange x,Session session) throws Exception {
-        Map<?,?> b=body(x);String name=string(b,"name","").trim();if(name.length()<3||name.length()>48){json(x,400,Map.of("error","Key name must be 3 to 48 characters"));return;}
+        Map<?,?> b=body(x);String name=string(b,"name","").trim();String scope=string(b,"scope","READ").trim().toUpperCase(Locale.ROOT);
+        if(name.length()<3||name.length()>48){json(x,400,Map.of("error","Key name must be 3 to 48 characters"));return;}
+        if(!Set.of("READ","READ_WRITE").contains(scope)){json(x,400,Map.of("error","scope must be READ or READ_WRITE"));return;}
         String raw="vv_live_"+randomToken();String hash=PanelDatabase.hashApiKey(raw);
-        if(!db.createApiKey(name,hash,session.username)){json(x,400,Map.of("error","Invalid name or duplicate key"));return;}
-        db.audit(session.username,"API_KEY_CREATED",name,clientIp(x),"Read-only API key created");json(x,201,Map.of("ok",true,"name",name,"apiKey",raw,"warning","Copy this key now. It cannot be displayed again."));
+        if(!db.createApiKey(name,hash,session.username,scope)){json(x,400,Map.of("error","Invalid name or duplicate key"));return;}
+        db.audit(session.username,"API_KEY_CREATED",name,clientIp(x),"Scope="+scope);json(x,201,Map.of("ok",true,"name",name,"scope",scope,"apiKey",raw,"warning","Copy this key now. It cannot be displayed again."));
     }
     private void revokeApiKey(HttpExchange x,Session session,String path) throws Exception {
         String raw=path.substring("/api/v1/integrations/keys/".length());long id;try{id=Long.parseLong(raw);}catch(NumberFormatException e){json(x,400,Map.of("error","Invalid key id"));return;}
-        if(!db.revokeApiKey(id)){json(x,404,Map.of("error","Key not found or already revoked"));return;}db.audit(session.username,"API_KEY_REVOKED",raw,clientIp(x),"Read-only API key revoked");json(x,200,Map.of("ok",true));
+        if(!db.revokeApiKey(id)){json(x,404,Map.of("error","Key not found or already revoked"));return;}db.audit(session.username,"API_KEY_REVOKED",raw,clientIp(x),"API key revoked");json(x,200,Map.of("ok",true));
     }
     private void createUser(HttpExchange x,Session session) throws Exception {Map<?,?> b=body(x);String username=string(b,"username","");String password=string(b,"password","");String role=string(b,"role","VIEWER").toUpperCase(Locale.ROOT);if(password.length()<12||password.length()>256){json(x,400,Map.of("error","Password must be 12 to 256 characters"));return;}String salt=PasswordUtil.newSalt();boolean ok=db.createUser(username,salt,PasswordUtil.hash(password,salt),role);if(!ok){json(x,400,Map.of("error","Invalid role, username or duplicate username"));return;}db.audit(session.username,"USER_CREATED",username,clientIp(x),role);json(x,201,Map.of("ok",true));}
     private void disableUser(HttpExchange x,Session session,String path) throws Exception {String username=URLDecoder.decode(path.substring("/api/v1/users/".length()),StandardCharsets.UTF_8);Map<?,?> b=body(x);boolean disabled=Boolean.parseBoolean(String.valueOf(b.containsKey("disabled")?b.get("disabled"):Boolean.TRUE));boolean ok=db.disableUser(username,disabled);if(disabled)sessions.entrySet().removeIf(e->e.getValue().username.equals(username));if(!ok){json(x,404,Map.of("error","User not found or cannot be disabled"));return;}db.audit(session.username,disabled?"USER_DISABLED":"USER_ENABLED",username,clientIp(x),"");json(x,200,Map.of("ok",true));}
-    private void setMaintenance(HttpExchange x,Session session) throws Exception {Map<?,?> b=body(x);maintenanceEnabled=Boolean.parseBoolean(String.valueOf(b.containsKey("enabled")?b.get("enabled"):Boolean.FALSE));maintenanceMessage=string(b,"message","The network is under maintenance.");if(maintenanceMessage.length()>200)maintenanceMessage=maintenanceMessage.substring(0,200);db.audit(session.username,"MAINTENANCE_CHANGED",null,clientIp(x),"enabled="+maintenanceEnabled);json(x,200,Map.of("ok",true,"enabled",maintenanceEnabled,"message",maintenanceMessage));}
+    private void setMaintenance(HttpExchange x,Session session) throws Exception {
+        Map<?,?> b=body(x);
+        maintenance.update(b);
+        Map<String,Object> state = maintenance.view();
+        if (maintenance.enabled() && maintenance.kickExistingPlayers()) {
+            // Apply the current policy whenever maintenance settings change, not
+            // only on the OFF -> ON transition (e.g. whitelist removal).
+            kickPlayersNotAllowedByMaintenance();
+        }
+        db.audit(session.username,"MAINTENANCE_CHANGED",null,clientIp(x),"enabled="+state.get("enabled"));
+        Map<String,Object> response = new LinkedHashMap<>(state); response.put("ok",true);
+        json(x,200,response);
+    }
+
+    private void kickPlayersNotAllowedByMaintenance() {
+        if (!maintenance.enabled() || !maintenance.kickExistingPlayers()) return;
+        for (Player player : proxy.getAllPlayers()) {
+            if (!maintenance.isAllowed(player.getUniqueId().toString())) {
+                player.disconnect(Component.text(maintenance.kickMessage()));
+            }
+        }
+    }
 
     private void requireOwner(HttpExchange x,Session s) throws ForbiddenException {if(!s.role.equals("OWNER"))throw new ForbiddenException();}
+    private void requireWriteAdmin(HttpExchange x,Session s) throws ForbiddenException {
+        if (s.apiKey) { if (!s.apiWrite) throw new ForbiddenException(); return; }
+        if (!s.role.equals("OWNER") && !s.role.equals("ADMINISTRATOR")) throw new ForbiddenException();
+    }
+    private String certificateFingerprint(TlsCertificateDetector.Material material) {
+        try {
+            java.security.cert.X509Certificate certificate;
+            if (material.kind() == TlsCertificateDetector.Material.Kind.PEM) {
+                try (InputStream in = Files.newInputStream(material.certificate())) { certificate = (java.security.cert.X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509").generateCertificate(in); }
+            } else {
+                java.security.KeyStore store = java.security.KeyStore.getInstance(material.keyStoreType());
+                try (InputStream in = Files.newInputStream(material.keyStore())) { store.load(in, material.keyStorePassword()==null?new char[0]:material.keyStorePassword().toCharArray()); }
+                certificate = null; var aliases = store.aliases(); while (aliases.hasMoreElements()) { var cert=store.getCertificate(aliases.nextElement()); if(cert instanceof java.security.cert.X509Certificate x) { certificate=x; break; } }
+                if(certificate==null)return "";
+            }
+            byte[] digest=java.security.MessageDigest.getInstance("SHA-256").digest(certificate.getEncoded());
+            return java.util.HexFormat.of().formatHex(digest);
+        } catch(Exception e) { return ""; }
+    }
+
+    private Map<String,Object> tlsStatus() {
+        Map<String,Object> result = new LinkedHashMap<>();
+        result.put("requestedMode", config.webMode());
+        result.put("activeMode", activeMode);
+        result.put("httpsAvailable", activeMode.equals("HTTPS") || activeMode.equals("BOTH"));
+        result.put("certificateDetected", tlsMaterial != null);
+        result.put("httpsPort", config.httpsPort());
+        result.put("httpPort", config.httpPort());
+        result.put("acmeEnabled", config.acmeEnabled());
+        result.put("acmeLastCheck", lastAcmeCheck); result.put("acmeLastError", lastAcmeError); result.put("certificateFingerprint", lastCertificateFingerprint.isBlank()?null:lastCertificateFingerprint);
+        result.put("reverseProxyMode", config.reverseProxyMode());
+        result.put("tlsTermination", config.reverseProxyMode()?"TRUSTED_REVERSE_PROXY":"PANEL_LISTENER");
+        if (config.acmeEnabled()) { result.put("acmeDomain", config.acmeDomain()); result.put("acmeCertificatePath", acme == null ? null : acme.certificatePath().toString()); }
+        if (tlsMaterial != null) result.put("certificate", tlsMaterial.view());
+        return result;
+    }
     private void requireRole(HttpExchange x,Session s,String... roles) throws ForbiddenException {if(Arrays.stream(roles).noneMatch(r->r.equals(s.role)))throw new ForbiddenException();}
     private Map<?,?> body(HttpExchange x) throws IOException {if(x.getRequestBody()==null)return Map.of();byte[] data=x.getRequestBody().readNBytes(1_048_577);if(data.length>1_048_576)throw new IOException("Request body too large");if(data.length==0)return Map.of();Object o=gson.fromJson(new String(data,StandardCharsets.UTF_8),Object.class);if(!(o instanceof Map<?,?> m))throw new IOException("Expected JSON object");return m;}
     private int queryInt(HttpExchange x,String key,int fallback){try{return Integer.parseInt(query(x).getOrDefault(key,String.valueOf(fallback)));}catch(Exception e){return fallback;}}
@@ -643,7 +830,7 @@ public final class WebPanelServer {
     private void json(HttpExchange x,int status,Object data)throws IOException{byte[] b=gson.toJson(data).getBytes(StandardCharsets.UTF_8);x.getResponseHeaders().set("Content-Type","application/json; charset=utf-8");x.sendResponseHeaders(status,b.length);x.getResponseBody().write(b);}
     private void safeJson(HttpExchange x,int status,Object data){try{json(x,status,data);}catch(Exception ignored){}}
     public void stop() {
-        for (ConfigurableApplicationContext context : springContexts) {
+        for (ConfigurableApplicationContext context : springContexts.values()) {
             try { context.close(); } catch (Exception e) { logger.warn("Failed to stop Spring Boot panel context cleanly", e); }
         }
         springContexts.clear();
@@ -651,7 +838,8 @@ public final class WebPanelServer {
         sessions.clear();
         pendingLogins.clear();
     }
-    private record Session(String username,String role,long expiresAt,boolean apiKey){}
+    private record Session(String username,String role,long expiresAt,boolean apiKey,boolean apiWrite){}
+    private record FailureState(int failures,long blockedUntil,long lastFailure){}
     private record PendingLogin(String username,String role,long expiresAt){}
     private record BackendHealth(String status,long latencyMs,long checkedAt){}
     private static final class ForbiddenException extends Exception{}

@@ -10,7 +10,7 @@ Base path: `/api/v1`. JSON is used for request and response bodies. Limits are c
 - `POST /login/2fa` completes the challenge with a six-digit TOTP code.
 - `POST /logout` invalidates the current session.
 - Browser/session-authenticated endpoints use the cookie. External applications should use an owner-created API key in `Authorization: Bearer vv_live_...`.
-- API keys are **read-only**: they are accepted only for GET requests. They must not be placed in client-side browser code.
+- API keys have `READ` or `READ_WRITE` scope. Read keys may use GET endpoints; write keys may call the supported MOTD/maintenance update and alias-reload endpoints. A write key is not an owner credential and cannot administer users or API keys. Never place keys in client-side browser code.
 
 ## API key management (OWNER only)
 
@@ -19,18 +19,18 @@ Base path: `/api/v1`. JSON is used for request and response bodies. Limits are c
 Request:
 
 ```json
-{"name":"Trusted read-only client"}
+{"name":"Trusted integration","scope":"READ"}
 ```
 
 Response (the raw key is shown once):
 
 ```json
-{"ok":true,"name":"Trusted read-only client","apiKey":"vv_live_...","warning":"Copy this key now. It cannot be displayed again."}
+{"ok":true,"name":"Trusted read-only client","apiKey":"vv_live_...","scope":"READ","warning":"Copy this key now. It cannot be displayed again."}
 ```
 
 ### `GET /integrations/keys`
 
-Lists metadata only: `id`, `name`, `createdBy`, `createdAt`, `lastUsed`, `revoked`. Raw keys and hashes are never returned.
+Lists metadata only: `id`, `name`, `createdBy`, `createdAt`, `lastUsed`, `revoked`, and `scope`. Raw keys and hashes are never returned.
 
 ### `DELETE /integrations/keys/{id}`
 
@@ -41,6 +41,10 @@ Revokes a key. The next request using it will fail authentication. A key cannot 
 | Method | Route | Purpose |
 |---|---|---|
 | GET | `/health` | Public health and version info |
+| GET | `/status` | Authenticated combined stats, MOTD, maintenance and TLS detection snapshot |
+| GET | `/tls` | Authenticated active listener mode and detected certificate metadata |
+| GET | `/motd` | Read normal/maintenance MOTD profiles |
+| GET | `/motd/preview` | Read the selected MOTD profile based on maintenance state |
 | GET | `/setup-status` | Whether initial setup is required |
 | GET | `/me` | Current account identity, role and expiry |
 | GET | `/sessions` | Active web sessions (OWNER only; token values are never exposed) |
@@ -64,11 +68,12 @@ Revokes a key. The next request using it will fail authentication. A key cannot 
 | GET | `/events?limit=100` | Recent player/network events |
 | GET | `/audit?limit=100` | Audit events (OWNER/ADMINISTRATOR session) |
 | GET | `/config` | Safe config view (OWNER/ADMINISTRATOR session; secrets are omitted) |
-| GET | `/maintenance` | Informational maintenance state |
+| GET | `/maintenance` | Maintenance state and UUID whitelist |
+| GET | `/maintenance/status` | Maintenance state plus online/whitelisted-online counts and active MOTD profile |
 | GET | `/2fa` | Current account TOTP status (session) |
 | GET/POST | `/routing` | Read/write the fallback order in native `velocity.toml` (OWNER writes; ADMINISTRATOR may read) |
 
-## Mutating endpoints (session required; API keys are denied)
+## Mutating endpoints (session required, except documented `READ_WRITE` API-key routes)
 
 | Method | Route | Access |
 |---|---|---|
@@ -88,7 +93,11 @@ Revokes a key. The next request using it will fail authentication. A key cannot 
 | POST | `/velocity-config/backups/restore` | OWNER; restore a timestamped Velocity config snapshot; proxy restart required |
 | GET/POST | `/users` | OWNER |
 | POST | `/users/{username}` | OWNER; disable/enable account |
-| PUT | `/maintenance` | OWNER, ADMINISTRATOR; informational only |
+| PUT | `/maintenance` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key |
+| PUT | `/motd` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key |
+| POST | `/maintenance/whitelist` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key; JSON `uuid` or online `playerName` |
+| POST/DELETE | `/maintenance/whitelist/{uuid}` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key |
+| POST | `/aliases/reload` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key |
 
 ## TOTP and routing
 
@@ -104,6 +113,17 @@ The Servers page can add, edit, and delete backend entries in the `[servers]` se
 curl "$VERTEX_PANEL_URL/api/v1/stats" \
   -H "Authorization: Bearer $VERTEX_PANEL_API_KEY"
 ```
+
+### Update maintenance using a READ_WRITE key
+
+```bash
+curl -X PUT "$VERTEX_PANEL_URL/api/v1/maintenance" \
+  -H "Authorization: Bearer $VERTEX_PANEL_WRITE_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled":true,"message":"Maintenance in progress","kickMessage":"Please try again later","whitelistEnabled":true,"allowExistingPlayers":true,"kickExistingPlayers":false}'
+```
+
+Use a dedicated `READ_WRITE` key for automation. Do not give it to read-only integrations; it can modify supported administrative settings.
 
 ### Node.js helper
 
@@ -146,7 +166,7 @@ Each command has a `vertex...` alias, for example `/vertexstats`. Grant permissi
 
 ## More language examples
 
-Language-neutral client examples are provided under `examples/`. They use the same HTTPS REST API and a read-only bearer API key. Set `VERTEX_URL` to the panel base URL and `VERTEX_API_KEY` to a key created by the owner in **API & Integrations**. Never embed keys in a public client or commit them to source control.
+Language-neutral client examples are provided under `examples/`. They use the same REST API and default to a read-only bearer API key. Set `VERTEX_URL` to the panel base URL and `VERTEX_API_KEY` to a key created by the owner in **API & Integrations**. Never embed keys in a public client or commit them to source control.
 
 Examples of filtered requests:
 
@@ -173,4 +193,19 @@ All SDKs call the same language-neutral REST routes; there is no separate API im
 | Node.js | `examples/node/vertex-client.mjs` | health, stats, players and filters, player profile, player directory, servers/details, commands, network, activity, events, analytics, maintenance |
 | Go, Java, C#/.NET, PHP, Ruby, Rust, PowerShell, Kotlin | `examples/` language folders | authenticated HTTP/JSON examples; call additional routes by changing the `/api/v1/...` path in the request |
 
-API keys are read-only. A request using an API key to a write endpoint must not be used for player actions, routing changes, maintenance changes, account management, or configuration updates.
+API keys have a scope: `READ` allows GET requests only; `READ_WRITE` allows write methods on routes that grant the Administrator role. Owner-only endpoints remain owner-only and cannot be accessed with API keys. Use the least-privilege scope and revoke exposed keys immediately.
+
+
+### MOTD, maintenance, and command aliases
+
+- `GET /api/v1/motd` — view the server-list MOTD configuration.
+- `PUT /api/v1/motd` — owner-only; save normal and maintenance MOTD lines.
+- `GET /api/v1/maintenance` — view maintenance state and UUID whitelist.
+- `PUT /api/v1/maintenance` — owner/administrator; update enabled state, messages, whitelist enforcement and UUID whitelist.
+- `POST /api/v1/maintenance/whitelist/{uuid}` — owner/administrator; add a valid player UUID.
+- `DELETE /api/v1/maintenance/whitelist/{uuid}` — owner/administrator; remove a UUID.
+- `GET /api/v1/aliases` — owner/administrator; inspect alias configuration.
+- `PUT /api/v1/aliases` — owner-only; validate, save and register alias definitions immediately.
+- `POST /api/v1/aliases/reload` — owner/administrator; reload `aliases.yml`.
+
+Command aliases are executed by Velocity with the original command source, so Velocity permission checks on the target command still apply. `/valiasreload` is also available in-game/console to reload `aliases.yml`.

@@ -25,4 +25,4 @@ The REST API is shared across all supported languages. Set `VERTEX_URL` to the p
 - PowerShell: `examples/powershell/vertex.ps1`
 - Kotlin: `examples/kotlin/VertexApiExample.kt`
 
-Each language uses standard HTTPS requests with `Authorization: Bearer ...`. In languages where the example is intentionally minimal, use the same request helper pattern and change the path/query to call any route listed above. API keys are read-only and cannot perform administrative mutations.
+Each language uses standard HTTPS requests with `Authorization: Bearer ...`. In languages where the example is intentionally minimal, use the same request helper pattern and change the path/query to call any route listed above. API keys use `READ` or `READ_WRITE` scope. `READ` is limited to GET requests; `READ_WRITE` can call write endpoints that allow the Administrator role. Owner-only routes still require an owner web session.

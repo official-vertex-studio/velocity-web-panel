@@ -43,15 +43,17 @@ The plugin creates `plugins/vertexvelocitywebpanel/config.yml`. The web panel us
 ```yaml
 web-panel:
   enabled: true
-  mode: HTTP # HTTP, HTTPS, or BOTH
+  mode: AUTO # AUTO, HTTP, HTTPS, or BOTH
   bind-address: 127.0.0.1
   http-port: 25569
   https-port: 8443
   https:
-    enabled: false
-    keystore: ''
-    keystore-password: ''
+    enabled: true
+    keystore: '' # optional; AUTO detects PEM certificates and keystores
+    keystore-password: '' # only needed for a protected keystore
     keystore-type: PKCS12
+    certificate: '' # optional PEM override
+    private-key: '' # optional PEM override
 ```
 
 For remote administration, use a trusted HTTPS certificate or a properly secured reverse proxy, restrict network access, and never expose an unencrypted HTTP listener directly to the public internet. Keep the keystore password and initial setup token private.
@@ -99,3 +101,59 @@ The distributable plugin JAR is produced under `target/`. Install the shaded `ve
 ---
 
 **Vertex Velocity Web Panel** — one control center for your Velocity network.
+
+## Custom Velocity command aliases
+
+On first startup, the plugin creates `plugins/vertexvelocitywebpanel/aliases.yml` from the bundled defaults. Define aliases under `aliases`, then restart the proxy for them to register. Existing aliases and built-in commands are not overwritten intentionally; aliases that collide with registered commands are logged and skipped.
+
+```yaml
+aliases:
+  lobby:
+    command: "server lobby"
+    permission: "vertexvelocity.alias.lobby"
+    player-only: true
+  whoami:
+    command: "send {player} UUID={uuid}, server={server}"
+    permission: "vertexvelocity.alias.whoami"
+    player-only: true
+```
+
+Supported placeholders: `{player}`, `{uuid}`, `{server}`, `{args}`, `{arg1}`, `{arg2}` and zero-based `{0}`, `{1}`, etc. `permission: ""` disables the alias-specific permission check; use a permission node for public servers. `player-only: true` prevents console execution. Alias targets are executed through Velocity's command manager as the original command source, so permissions of the invoking user still apply.
+
+### Maintenance, MOTD and TLS files
+
+Runtime YAML files are stored in `plugins/vertexvelocitywebpanel/`: `config.yml`, `maintenance.yml`, `motd.yml`, `tls.yml`, and `aliases.yml`. Default templates are bundled under `src/main/resources/defaults/`; runtime changes are persisted to the plugin data directory.
+
+Maintenance enforcement runs at Velocity pre-login. With maintenance enabled and whitelist enforcement enabled, UUIDs not in the whitelist are denied. `allow-existing-players` controls reconnect/pre-login behavior for players already online, and `kick-existing-players` can disconnect non-whitelisted players when maintenance is enabled. The whitelist uses UUIDs as its canonical identity; the API can resolve a `playerName` only while that player is online.
+
+Authenticated API routes include `GET /api/v1/status`, `GET /api/v1/maintenance`, `GET /api/v1/maintenance/status`, `PUT /api/v1/maintenance`, `GET /api/v1/motd`, `GET /api/v1/motd/preview`, and `PUT /api/v1/motd`. API keys can be created with `scope: READ` or `scope: READ_WRITE`. Write keys can modify supported MOTD/maintenance settings and reload aliases; they do not become owner keys and cannot administer users or create/revoke API keys.
+
+With `web-panel.mode: AUTO`, TLS is discovered at startup without filling in a path. The detector checks `plugins/vertexvelocitywebpanel/tls/`, the plugin data folder, `./tls`, common Let's Encrypt/system certificate directories, and additional roots in `tls.yml`. Supported PEM pairs include `fullchain.pem` + `privkey.pem` and `tls.crt` + `tls.key`; existing PKCS12/PFX/JKS keystores are also detected. PEM certificates do not require a keystore password. HTTPS uses the configured HTTPS port (8443 by default).
+
+#### Automatic ACME / Let's Encrypt
+
+The plugin can automatically request and renew a public certificate through **Certbot** using ACME HTTP-01 validation. Certbot must be installed and executable inside the same Pterodactyl container/runtime as the plugin. In `plugins/vertexvelocitywebpanel/config.yml`, configure the `acme` section:
+
+```yaml
+web-panel:
+  bind-address: 0.0.0.0
+  http-port: 80       # or a container port that public TCP/80 is forwarded to
+  https-port: 8443
+  mode: AUTO
+acme:
+  enabled: true
+  domain: panel.example.com
+  email: admin@example.com
+  certbot-command: certbot
+  renewal-check-hours: 12
+```
+
+Replace the example domain and email. The domain's public DNS A/AAAA records must point to this server, and inbound **TCP port 80** must reach the plugin's HTTP listener (directly or through a reverse proxy that forwards `/.well-known/acme-challenge/` unchanged). Do not configure a public AAAA record unless IPv6 reaches this listener too. The plugin serves HTTP-01 challenge files, requests the initial certificate, checks renewal on the configured interval, and attempts to reload its embedded HTTPS listener when the certificate expiry changes.
+
+Certbot's configuration, work files, logs, webroot and issued certificates are stored under `plugins/vertexvelocitywebpanel/acme/` so the plugin does not hard-code `/etc/letsencrypt` or require root merely to write its certificate store. However, **Certbot itself must still be installed and executable** in the runtime, and the process must be able to bind/listen on the configured ports. A standard Pterodactyl container often does not include Certbot; the plugin cannot install it into the container or open host firewall/allocations. Failed issuance is logged and retried on a later check. Do not expose authenticated panel traffic over plain HTTP; for production, use a trusted reverse proxy to serve HTTPS and forward only the ACME challenge path to the plugin's HTTP listener, or firewall normal HTTP traffic.
+
+This is a Certbot-backed integration, not a bundled ACME protocol implementation. Before public use, test DNS, HTTP-01 reachability, initial issuance, renewal and listener reload on a staging domain. A successful Certbot exit alone does not prove that the public route or browser HTTPS works.
+
+## Release validation and limitations
+
+See [`docs/REMAINING-VALIDATION.md`](docs/REMAINING-VALIDATION.md) for TOTP recovery-code behavior, ACME deployment requirements, settings that require a Velocity restart, and the mandatory Java 25 / real-proxy release checklist. The checklist is not evidence that those tests have already passed.

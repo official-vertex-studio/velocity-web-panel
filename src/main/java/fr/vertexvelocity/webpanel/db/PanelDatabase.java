@@ -25,6 +25,7 @@ public final class PanelDatabase implements AutoCloseable {
             s.execute("PRAGMA journal_mode=WAL"); s.execute("PRAGMA foreign_keys=ON");
             s.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, salt TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL, created_at INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0)");
             s.execute("CREATE TABLE IF NOT EXISTS user_totp(username TEXT PRIMARY KEY, secret TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)");
+            s.execute("CREATE TABLE IF NOT EXISTS user_totp_recovery(username TEXT NOT NULL, code_hash TEXT NOT NULL, used_at INTEGER, PRIMARY KEY(username,code_hash), FOREIGN KEY(username) REFERENCES user_totp(username) ON DELETE CASCADE)");
             s.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)");
             s.execute("CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, uuid TEXT, username TEXT, server_name TEXT, details TEXT, created_at INTEGER NOT NULL)");
             s.execute("CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at)");
@@ -34,7 +35,8 @@ public final class PanelDatabase implements AutoCloseable {
             s.execute("CREATE INDEX IF NOT EXISTS idx_backend_metrics_server_time ON backend_metrics(server_name,sampled_at)");
             s.execute("CREATE INDEX IF NOT EXISTS idx_events_player_time ON events(uuid,created_at)");
             s.execute("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT, action TEXT NOT NULL, target TEXT, ip TEXT, details TEXT, created_at INTEGER NOT NULL)");
-            s.execute("CREATE TABLE IF NOT EXISTS api_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, last_used INTEGER, revoked INTEGER NOT NULL DEFAULT 0)");
+            s.execute("CREATE TABLE IF NOT EXISTS api_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, last_used INTEGER, revoked INTEGER NOT NULL DEFAULT 0, scope TEXT NOT NULL DEFAULT 'READ')");
+            try { s.execute("ALTER TABLE api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'READ'"); } catch (SQLException ignored) { /* Existing database already has the column. */ }
         }
     }
     public synchronized int userCount() throws SQLException { try (Statement s=connection.createStatement(); ResultSet r=s.executeQuery("SELECT COUNT(*) FROM users")) { return r.next()?r.getInt(1):0; } }
@@ -69,10 +71,25 @@ public final class PanelDatabase implements AutoCloseable {
     public synchronized String createPendingTotp(String username,String secret) throws SQLException {
         try(PreparedStatement p=connection.prepareStatement("INSERT INTO user_totp(username,secret,enabled,updated_at) VALUES(?,?,0,?) ON CONFLICT(username) DO UPDATE SET secret=excluded.secret,enabled=0,updated_at=excluded.updated_at")){p.setString(1,username);p.setString(2,secret);p.setLong(3,Instant.now().getEpochSecond());p.executeUpdate();} return secret;
     }
-    public synchronized void enableTotp(String username) throws SQLException {
-        try(PreparedStatement p=connection.prepareStatement("UPDATE user_totp SET enabled=1,updated_at=? WHERE username=?")){p.setLong(1,Instant.now().getEpochSecond());p.setString(2,username);if(p.executeUpdate()!=1)throw new SQLException("TOTP setup was not found");}
+    public synchronized void enableTotp(String username, List<String> recoveryCodeHashes) throws SQLException {
+        connection.setAutoCommit(false);
+        try {
+            try(PreparedStatement p=connection.prepareStatement("UPDATE user_totp SET enabled=1,updated_at=? WHERE username=?")){p.setLong(1,Instant.now().getEpochSecond());p.setString(2,username);if(p.executeUpdate()!=1)throw new SQLException("TOTP setup was not found");}
+            try(PreparedStatement d=connection.prepareStatement("DELETE FROM user_totp_recovery WHERE username=?")){d.setString(1,username);d.executeUpdate();}
+            try(PreparedStatement p=connection.prepareStatement("INSERT INTO user_totp_recovery(username,code_hash) VALUES(?,?)")){for(String hash:recoveryCodeHashes){p.setString(1,username);p.setString(2,hash);p.addBatch();}p.executeBatch();}
+            connection.commit();
+        } catch(SQLException e) { connection.rollback(); throw e; }
+        finally { connection.setAutoCommit(true); }
     }
-    public synchronized void disableTotp(String username) throws SQLException {try(PreparedStatement p=connection.prepareStatement("DELETE FROM user_totp WHERE username=?")){p.setString(1,username);p.executeUpdate();}}
+    public synchronized boolean consumeTotpRecoveryCode(String username, String codeHash) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("UPDATE user_totp_recovery SET used_at=? WHERE username=? AND code_hash=? AND used_at IS NULL")) {
+            p.setLong(1,Instant.now().getEpochSecond()); p.setString(2,username); p.setString(3,codeHash); return p.executeUpdate()==1;
+        }
+    }
+    public synchronized void disableTotp(String username) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("DELETE FROM user_totp_recovery WHERE username=?")){p.setString(1,username);p.executeUpdate();}
+        try(PreparedStatement p=connection.prepareStatement("DELETE FROM user_totp WHERE username=?")){p.setString(1,username);p.executeUpdate();}
+    }
     public synchronized List<Map<String,Object>> users() throws SQLException {
         List<Map<String,Object>> out=new ArrayList<>(); try(Statement s=connection.createStatement();ResultSet r=s.executeQuery("SELECT username,role,created_at,disabled FROM users ORDER BY username")) { while(r.next()){ Map<String,Object> m=new LinkedHashMap<>();m.put("username",r.getString(1));m.put("role",r.getString(2));m.put("createdAt",r.getLong(3));m.put("disabled",r.getInt(4)!=0);out.add(m);} } return out;
     }
@@ -132,15 +149,23 @@ public final class PanelDatabase implements AutoCloseable {
         List<Map<String,Object>> out=new ArrayList<>();try(PreparedStatement p=connection.prepareStatement("SELECT actor,action,target,ip,details,created_at FROM audit ORDER BY id DESC LIMIT ?")){p.setInt(1,Math.max(1,Math.min(500,limit)));try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object>m=new LinkedHashMap<>();m.put("actor",r.getString(1));m.put("action",r.getString(2));m.put("target",r.getString(3));m.put("ip",r.getString(4));m.put("details",r.getString(5));m.put("timestamp",r.getLong(6));out.add(m);}}}return out;
     }
     public synchronized void prune(int retentionDays) { long cutoff=Instant.now().minusSeconds(Math.max(1,retentionDays)*86400L).getEpochSecond(); try(PreparedStatement p=connection.prepareStatement("DELETE FROM metrics WHERE sampled_at<?")){p.setLong(1,cutoff);p.executeUpdate();}catch(SQLException ignored){} try(PreparedStatement p=connection.prepareStatement("DELETE FROM events WHERE created_at<?")){p.setLong(1,cutoff);p.executeUpdate();}catch(SQLException ignored){} try(PreparedStatement p=connection.prepareStatement("DELETE FROM backend_metrics WHERE sampled_at<?")){p.setLong(1,cutoff);p.executeUpdate();}catch(SQLException ignored){} }
-    public synchronized boolean createApiKey(String name,String keyHash,String createdBy) throws SQLException {
-        if(name==null || !name.matches("[A-Za-z0-9 _.-]{3,48}")) return false;
-        try(PreparedStatement p=connection.prepareStatement("INSERT INTO api_keys(name,key_hash,created_by,created_at) VALUES(?,?,?,?)")) { p.setString(1,name);p.setString(2,keyHash);p.setString(3,createdBy);p.setLong(4,Instant.now().getEpochSecond());p.executeUpdate();return true; } catch(SQLException e) { return false; }
+    public synchronized boolean createApiKey(String name,String keyHash,String createdBy,String scope) throws SQLException {
+        if(name==null || !name.matches("[A-Za-z0-9 _.-]{3,48}") || !Set.of("READ", "READ_WRITE").contains(scope)) return false;
+        try(PreparedStatement p=connection.prepareStatement("INSERT INTO api_keys(name,key_hash,created_by,created_at,scope) VALUES(?,?,?,?,?)")) { p.setString(1,name);p.setString(2,keyHash);p.setString(3,createdBy);p.setLong(4,Instant.now().getEpochSecond());p.setString(5,scope);p.executeUpdate();return true; } catch(SQLException e) { return false; }
     }
     public synchronized List<Map<String,Object>> apiKeys() throws SQLException {
-        List<Map<String,Object>> out=new ArrayList<>();try(Statement s=connection.createStatement();ResultSet r=s.executeQuery("SELECT id,name,created_by,created_at,last_used,revoked FROM api_keys ORDER BY id DESC")){while(r.next()){Map<String,Object> m=new LinkedHashMap<>();m.put("id",r.getLong(1));m.put("name",r.getString(2));m.put("createdBy",r.getString(3));m.put("createdAt",r.getLong(4));m.put("lastUsed",nullableLong(r,5));m.put("revoked",r.getInt(6)!=0);out.add(m);}}return out;
+        List<Map<String,Object>> out=new ArrayList<>();try(Statement s=connection.createStatement();ResultSet r=s.executeQuery("SELECT id,name,created_by,created_at,last_used,revoked,scope FROM api_keys ORDER BY id DESC")){while(r.next()){Map<String,Object> m=new LinkedHashMap<>();m.put("id",r.getLong(1));m.put("name",r.getString(2));m.put("createdBy",r.getString(3));m.put("createdAt",r.getLong(4));m.put("lastUsed",nullableLong(r,5));m.put("revoked",r.getInt(6)!=0);m.put("scope",r.getString(7));out.add(m);}}return out;
     }
-    public synchronized boolean authenticateApiKey(String keyHash) throws SQLException {
-        try(PreparedStatement p=connection.prepareStatement("SELECT id FROM api_keys WHERE key_hash=? AND revoked=0")){p.setString(1,keyHash);try(ResultSet r=p.executeQuery()){if(!r.next())return false;long id=r.getLong(1);try(PreparedStatement u=connection.prepareStatement("UPDATE api_keys SET last_used=? WHERE id=?")){u.setLong(1,Instant.now().getEpochSecond());u.setLong(2,id);u.executeUpdate();}return true;}}
+    public synchronized String authenticateApiKeyScope(String keyHash) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("SELECT id,scope FROM api_keys WHERE key_hash=? AND revoked=0")) {
+            p.setString(1,keyHash);
+            try(ResultSet r=p.executeQuery()) {
+                if(!r.next()) return null;
+                long id=r.getLong(1); String scope=r.getString(2);
+                try(PreparedStatement u=connection.prepareStatement("UPDATE api_keys SET last_used=? WHERE id=?")) { u.setLong(1,Instant.now().getEpochSecond()); u.setLong(2,id); u.executeUpdate(); }
+                return scope==null?"READ":scope;
+            }
+        }
     }
     public synchronized boolean revokeApiKey(long id) throws SQLException {try(PreparedStatement p=connection.prepareStatement("UPDATE api_keys SET revoked=1 WHERE id=? AND revoked=0")){p.setLong(1,id);return p.executeUpdate()>0;}}
     public static String hashApiKey(String key) throws Exception { return sha256(key); }

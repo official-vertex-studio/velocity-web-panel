@@ -1,0 +1,14 @@
+# TLS auto-discovery. No path is required for the default search locations.
+# Add extra directories only if your certificates live elsewhere.
+mode: auto
+search-paths:
+  - '${PLUGIN_DATA}/tls'
+  - '${PLUGIN_DATA}'
+  - './tls'
+  - '/etc/letsencrypt/live'
+  - '/etc/ssl/private'
+  - '/etc/ssl/certs'
+  - '/var/lib/letsencrypt'
+# Recognized PEM pairs: fullchain.pem + privkey.pem, cert.pem + privkey.pem,
+# tls.crt + tls.key, certificate.crt + private.key, cert.crt + key.pem.
+# Recognized keystores: keystore.p12, keystore.pfx, keystore.jks.

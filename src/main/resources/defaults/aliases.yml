@@ -1,0 +1,19 @@
+# Vertex Velocity Web Panel — command aliases
+#
+# Each key becomes a command registered directly with Velocity.
+# command: target command without the leading slash
+# permission: Velocity permission node; empty means no extra permission check
+# player-only: true to reject console execution
+# Placeholders: {player}, {uuid}, {server}, {args}, {arg1}, {arg2}, {0}, {1}...
+#
+# Example:
+# aliases:
+#   lobby:
+#     command: "server lobby"
+#     permission: "vertexvelocity.alias.lobby"
+#     player-only: true
+#   discord:
+#     command: "send {player} Join our Discord: example.invalid"
+#     permission: ""
+#     player-only: true
+aliases: {}

@@ -1,0 +1,10 @@
+# Default MOTD profile. Copied as a template; runtime config belongs in the plugin data folder.
+enabled: true
+normal:
+  line-1: "&b&lVertex Network"
+  line-2: "&7A premium Minecraft network"
+maintenance:
+  line-1: "&c&lMAINTENANCE"
+  line-2: "&7The network is temporarily unavailable"
+player-sample:
+  enabled: true

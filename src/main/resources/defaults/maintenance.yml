@@ -1,0 +1,9 @@
+# UUIDs are authoritative. Never use player names as the sole whitelist identifier.
+enabled: false
+message: "The network is under maintenance."
+kick-message: "The network is currently under maintenance."
+whitelist-enabled: true
+allow-existing-players: true
+# If enabled, non-whitelisted players already connected are disconnected when maintenance is enabled.
+kick-existing-players: false
+whitelist: []
