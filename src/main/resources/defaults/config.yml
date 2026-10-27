@@ -1,7 +1,7 @@
-# Vertex Velocity Web Panel 3.0.0 — primary configuration
+# Vertex Velocity Web Panel 4.0.0 — primary configuration
 web-panel:
   enabled: true
-  # HTTP-only default for this release. HTTPS can be configured later.
+  # HTTP is the safe default for first setup. Configure TLS before switching to HTTPS/BOTH.
   mode: HTTP
   # Set true only behind a trusted HTTPS reverse proxy that terminates TLS.
   reverse-proxy: false

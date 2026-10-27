@@ -43,7 +43,7 @@ The plugin creates `plugins/vertexvelocitywebpanel/config.yml`. The web panel us
 ```yaml
 web-panel:
   enabled: true
-  mode: AUTO # AUTO, HTTP, HTTPS, or BOTH
+  mode: HTTP # HTTP by default; AUTO, HTTPS, or BOTH can be enabled later
   bind-address: 127.0.0.1
   http-port: 25569
   https-port: 8443
@@ -139,7 +139,7 @@ web-panel:
   bind-address: 0.0.0.0
   http-port: 80       # or a container port that public TCP/80 is forwarded to
   https-port: 8443
-  mode: AUTO
+  mode: HTTP
 acme:
   enabled: true
   domain: panel.example.com

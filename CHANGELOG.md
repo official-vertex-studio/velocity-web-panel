@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.0.0 — Runtime packaging and release baseline (2026-10-27)
+
+- Bump Maven artifact and Velocity plugin metadata to `4.0.0`.
+- Add an explicit Spring Boot 4 MVC runtime dependency to the shaded plugin package, targeting the reported missing `WebMvcWebApplicationTypeDeducer` class.
+- Make HTTP the default listener mode and disable HTTPS by default for initial setup.
+- Correct the `/api/v1/health` version field to report `4.0.0`.
+- Add a release checklist and Git tag workflow guide.
+
+**Validation status:** source/static checks only in the preparation environment. Maven/Java 25 compilation and a real Velocity startup must pass before publishing this release.
+
+# Changelog
+
 ## 3.0.0 — Velocity API compatibility and consolidation (2026-10-27)
 
 - Updated Maven artifact version and Velocity plugin metadata to `3.0.0`.

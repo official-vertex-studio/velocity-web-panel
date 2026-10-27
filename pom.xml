@@ -1,6 +1,6 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-  <modelVersion>3.1.0</modelVersion>
-  <groupId>fr.vertexvelocity</groupId><artifactId>vertex-velocity-web-panel</artifactId><version>3.1.0</version>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>fr.vertexvelocity</groupId><artifactId>vertex-velocity-web-panel</artifactId><version>4.0.0</version>
   <name>Vertex Velocity Web Panel</name>
   <properties><maven.compiler.release>25</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding><spring-boot.version>4.1.2</spring-boot.version></properties>
   <repositories><repository><id>papermc</id><url>https://repo.papermc.io/repository/maven-public/</url></repository></repositories>
@@ -16,8 +16,8 @@
     </dependencies>
   </dependencyManagement>
   <dependencies>
-    <!-- Explicitly include Boot 4's MVC application-type deducer. Some shaded/plugin classloaders
-         otherwise fail while constructing SpringApplicationBuilder. -->
+    <!-- Explicitly include the Boot 4 MVC runtime module. The panel is embedded in Velocity,
+         so its runtime classpath is assembled by Maven Shade rather than the Boot launcher. -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-webmvc</artifactId>
