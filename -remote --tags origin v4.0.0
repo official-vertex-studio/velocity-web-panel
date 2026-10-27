@@ -1,0 +1,158 @@
+[33mtag v4.0.0[m
+Tagger: official-vertex-studio <contact.vertexdev@gmail.com>
+Date:   Tue Oct 27 17:09:22 2026 +0100
+
+Vertex Velocity Web Panel 4.0.0
+
+[33mcommit 5ddae9fd638ce930aa1b7e9ca9d696a9c88686ff[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;33mtag: [m[1;33mv4.0.0[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
+Author: official-vertex-studio <contact.vertexdev@gmail.com>
+Date:   Tue Oct 27 17:09:03 2026 +0100
+
+    Release: Vertex Velocity Web Panel 4.0.0
+
+[1mdiff --git a/CHANGELOG.md b/CHANGELOG.md[m
+[1mindex 93cae64..6506202 100644[m
+[1m--- a/CHANGELOG.md[m
+[1m+++ b/CHANGELOG.md[m
+[36m@@ -1,5 +1,17 @@[m
+ # Changelog[m
+ [m
+[32m+[m[32m## 4.0.0 — Runtime packaging and release baseline (2026-10-27)[m
+[32m+[m
+[32m+[m[32m- Bump Maven artifact and Velocity plugin metadata to `4.0.0`.[m
+[32m+[m[32m- Add an explicit Spring Boot 4 MVC runtime dependency to the shaded plugin package, targeting the reported missing `WebMvcWebApplicationTypeDeducer` class.[m
+[32m+[m[32m- Make HTTP the default listener mode and disable HTTPS by default for initial setup.[m
+[32m+[m[32m- Correct the `/api/v1/health` version field to report `4.0.0`.[m
+[32m+[m[32m- Add a release checklist and Git tag workflow guide.[m
+[32m+[m
+[32m+[m[32m**Validation status:** source/static checks only in the preparation environment. Maven/Java 25 compilation and a real Velocity startup must pass before publishing this release.[m
+[32m+[m
+[32m+[m[32m# Changelog[m
+[32m+[m
+ ## 3.0.0 — Velocity API compatibility and consolidation (2026-10-27)[m
+ [m
+ - Updated Maven artifact version and Velocity plugin metadata to `3.0.0`.[m
+[1mdiff --git a/README.md b/README.md[m
+[1mindex b025e89..229c227 100644[m
+[1m--- a/README.md[m
+[1m+++ b/README.md[m
+[36m@@ -43,7 +43,7 @@[m [mThe plugin creates `plugins/vertexvelocitywebpanel/config.yml`. The web panel us[m
+ ```yaml[m
+ web-panel:[m
+   enabled: true[m
+[31m-  mode: AUTO # AUTO, HTTP, HTTPS, or BOTH[m
+[32m+[m[32m  mode: HTTP # HTTP by default; AUTO, HTTPS, or BOTH can be enabled later[m
+   bind-address: 127.0.0.1[m
+   http-port: 25569[m
+   https-port: 8443[m
+[36m@@ -139,7 +139,7 @@[m [mweb-panel:[m
+   bind-address: 0.0.0.0[m
+   http-port: 80       # or a container port that public TCP/80 is forwarded to[m
+   https-port: 8443[m
+[31m-  mode: AUTO[m
+[32m+[m[32m  mode: HTTP[m
+ acme:[m
+   enabled: true[m
+   domain: panel.example.com[m
+[1mdiff --git a/RELEASE-PUSH-GUIDE.md b/RELEASE-PUSH-GUIDE.md[m
+[1mnew file mode 100644[m
+[1mindex 0000000..bc8d142[m
+[1m--- /dev/null[m
+[1m+++ b/RELEASE-PUSH-GUIDE.md[m
+[36m@@ -0,0 +1,65 @@[m
+[32m+[m[32m# Vertex Velocity Web Panel 4.0.0 — build, push and release[m
+[32m+[m
+[32m+[m[32m> Do not publish a release until `mvn clean verify` succeeds and the shaded JAR starts on a test Velocity proxy. A Git tag does not prove the plugin is bug-free.[m
+[32m+[m
+[32m+[m[32m## 1. Open the repository[m
+[32m+[m
+[32m+[m[32mOpen the extracted project root in IntelliJ IDEA. The folder must contain `pom.xml`, `src/`, and `.github/`.[m
+[32m+[m
+[32m+[m[32m## 2. Confirm Java 25 and build[m
+[32m+[m
+[32m+[m[32mIn the IntelliJ terminal:[m
+[32m+[m
+[32m+[m[32m```bash[m
+[32m+[m[32mjava -version[m
+[32m+[m[32mmvn -version[m
+[32m+[m[32mmvn --batch-mode clean verify[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32mBoth Java and Maven must be available; Java must be version 25. The expected artifact is:[m
+[32m+[m
+[32m+[m[32m`target/vertex-velocity-web-panel-4.0.0.jar`[m
+[32m+[m
+[32m+[m[32mIf the build fails, do not continue to tagging. Fix the first Maven error and rerun the command.[m
+[32m+[m
+[32m+[m[32m## 3. Check Git status and commit[m
+[32m+[m
+[32m+[m[32mRun these commands from the root of your existing Git clone (not a freshly extracted ZIP):[m
+[32m+[m
+[32m+[m[32m```bash[m
+[32m+[m[32mgit status[m
+[32m+[m[32mgit branch --show-current[m
+[32m+[m[32mgit remote -v[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32mEnsure you are on the intended branch and `origin` points to `official-vertex-studio/velocity-web-panel`. Review the diff, then:[m
+[32m+[m
+[32m+[m[32m```bash[m
+[32m+[m[32mgit add .[m
+[32m+[m[32mgit commit -m "Release: Vertex Velocity Web Panel 4.0.0"[m
+[32m+[m[32mgit push origin main[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32mIf your default branch is not `main`, replace `main` with the actual branch name. If Git says there is nothing to commit, that is okay only if the intended 4.0.0 changes are already committed.[m
+[32m+[m
+[32m+[m[32m## 4. Ensure the tag does not already exist[m
+[32m+[m
+[32m+[m[32m```bash[m
+[32m+[m[32mgit fetch --tags[m
+[32m+[m[32mgit tag --list v4.0.0[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32mIf `v4.0.0` is already listed, stop and inspect it; do not force-move a published tag. If no output appears, create and push the annotated tag:[m
+[32m+[m
+[32m+[m[32m```bash[m
+[32m+[m[32mgit tag -a v4.0.0 -m "Vertex Velocity Web Panel 4.0.0"[m
+[32m+[m[32mgit push origin v4.0.0[m
+[32m+[m[32m```[m
+[32m+[m
+[32m+[m[32m## 5. Watch GitHub Actions[m
+[32m+[m
+[32m+[m[32mOpen the repository's **Actions** tab. The release workflow checks that the tag version matches `pom.xml`, runs `mvn clean verify`, checks for the expected JAR, and only then creates the GitHub Release. If the workflow fails, fix the cause and use a new patch version/tag (for example `v4.0.1`) rather than reusing or force-moving `v4.0.0`.[m
+[32m+[m
+[32m+[m[32m## 6. Test before replacing production[m
+[32m+[m
+[32m+[m[32mInstall the resulting JAR on a test Velocity instance using Java 25. Check startup logs, open the configured HTTP panel address, test login and key pages/API endpoints, then check shutdown/restart. Back up the current plugin JAR and data directory before any production replacement.[m
+[1mdiff --git a/pom.xml b/pom.xml[m
+[1mindex 3e882f7..df242e4 100644[m
+[1m--- a/pom.xml[m
+[1m+++ b/pom.xml[m
+[36m@@ -1,6 +1,6 @@[m
+ <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">[m
+[31m-  <modelVersion>3.1.0</modelVersion>[m
+[31m-  <groupId>fr.vertexvelocity</groupId><artifactId>vertex-velocity-web-panel</artifactId><version>3.1.0</version>[m
+[32m+[m[32m  <modelVersion>4.0.0</modelVersion>[m
+[32m+[m[32m  <groupId>fr.vertexvelocity</groupId><artifactId>vertex-velocity-web-panel</artifactId><version>4.0.0</version>[m
+   <name>Vertex Velocity Web Panel</name>[m
+   <properties><maven.compiler.release>25</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding><spring-boot.version>4.1.2</spring-boot.version></properties>[m
+   <repositories><repository><id>papermc</id><url>https://repo.papermc.io/repository/maven-public/</url></repository></repositories>[m
+[36m@@ -16,8 +16,8 @@[m
+     </dependencies>[m
+   </dependencyManagement>[m
+   <dependencies>[m
+[31m-    <!-- Explicitly include Boot 4's MVC application-type deducer. Some shaded/plugin classloaders[m
+[31m-         otherwise fail while constructing SpringApplicationBuilder. -->[m
+[32m+[m[32m    <!-- Explicitly include the Boot 4 MVC runtime module. The panel is embedded in Velocity,[m
+[32m+[m[32m         so its runtime classpath is assembled by Maven Shade rather than the Boot launcher. -->[m
+     <dependency>[m
+       <groupId>org.springframework.boot</groupId>[m
+       <artifactId>spring-boot-webmvc</artifactId>[m
+[1mdiff --git a/src/main/java/fr/vertexvelocity/webpanel/VertexVelocityWebPanel.java b/src/main/java/fr/vertexvelocity/webpanel/VertexVelocityWebPanel.java[m
+[1mindex 0740a7a..753f0ee 100644[m
+[1m--- a/src/main/java/fr/vertexvelocity/webpanel/VertexVelocityWebPanel.java[m
+[1m+++ b/src/main/java/fr/vertexvelocity/webpanel/VertexVelocityWebPanel.java[m
+[36m@@ -26,7 +26,7 @@[m [mimport java.nio.file.Path;[m
+ import java.time.Instant;[m
+ import jav
