@@ -1,16 +1,15 @@
-# Vertex Velocity Web Panel 2.0.0 — primary configuration
+# Vertex Velocity Web Panel 3.0.0 — primary configuration
 web-panel:
   enabled: true
-  # AUTO chooses HTTPS when a valid certificate/private key or keystore is discovered;
-  # otherwise it starts HTTP and logs a warning. HTTP, HTTPS and BOTH are explicit modes.
-  mode: AUTO
+  # HTTP-only default for this release. HTTPS can be configured later.
+  mode: HTTP
   # Set true only behind a trusted HTTPS reverse proxy that terminates TLS.
   reverse-proxy: false
   bind-address: 127.0.0.1
   http-port: 25569
   https-port: 8443
   https:
-    enabled: true
+    enabled: false
     # Optional overrides. In AUTO mode the detector searches TLS assets automatically.
     keystore: ''
     keystore-password: ''

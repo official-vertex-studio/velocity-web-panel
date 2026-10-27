@@ -16,6 +16,12 @@
     </dependencies>
   </dependencyManagement>
   <dependencies>
+    <!-- Explicitly include Boot 4's MVC application-type deducer. Some shaded/plugin classloaders
+         otherwise fail while constructing SpringApplicationBuilder. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-webmvc</artifactId>
+    </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-webmvc</artifactId>

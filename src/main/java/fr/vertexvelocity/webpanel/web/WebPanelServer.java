@@ -215,7 +215,7 @@ public final class WebPanelServer {
             }
             if(path.equals("/")||path.equals("/index.html")){serveResource(x,"/web/index.html","text/html; charset=utf-8");return;}
             if(path.startsWith("/assets/")){serveResource(x,"/web"+path,"text/plain; charset=utf-8");return;}
-            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","2.1.1","timestamp",Instant.now().getEpochSecond()));return;}
+            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","3.0.0","timestamp",Instant.now().getEpochSecond()));return;}
             if(path.equals("/api/v1/setup-status")&&method.equals("GET")){json(x,200,Map.of("needsSetup",db.userCount()==0));return;}
             if(path.equals("/api/v1/setup")&&method.equals("POST")){setup(x);return;}
             if(path.equals("/api/v1/login")&&method.equals("POST")){login(x);return;}
