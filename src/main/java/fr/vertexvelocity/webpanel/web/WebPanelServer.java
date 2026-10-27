@@ -3,10 +3,6 @@ package fr.vertexvelocity.webpanel.web;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.sun.net.httpserver.*;
-import fr.vertexvelocity.webpanel.spring.PanelWebApplication;
-import org.springframework.boot.WebApplicationType;
-import org.springframework.boot.builder.SpringApplicationBuilder;
-import org.springframework.context.ConfigurableApplicationContext;
 import com.velocitypowered.api.proxy.*;
 import com.velocitypowered.api.proxy.server.RegisteredServer;
 import com.velocitypowered.api.proxy.server.ServerInfo;
@@ -25,6 +21,14 @@ import fr.vertexvelocity.webpanel.commands.CommandAliasService;
 
 import java.io.*;
 import java.net.*;
+import javax.net.ssl.*;
+import java.security.KeyFactory;
+import java.security.KeyStore;
+import java.security.PrivateKey;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.security.spec.PKCS8EncodedKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.Instant;
@@ -42,7 +46,11 @@ public final class WebPanelServer {
     private volatile String lastAcmeError = "No ACME error recorded";
     private volatile String lastAcmeCheck = "Not checked yet";
     private volatile String lastCertificateFingerprint = "";
-    private final Map<Boolean, ConfigurableApplicationContext> springContexts = new ConcurrentHashMap<>();
+    private final Map<Boolean, HttpServer> webServers = new ConcurrentHashMap<>();
+    private final ExecutorService webExecutor = new ThreadPoolExecutor(
+            4, 32, 60L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(512),
+            r -> { Thread t = new Thread(r, "vertex-web-panel-http"); t.setDaemon(true); return t; },
+            new ThreadPoolExecutor.CallerRunsPolicy());
     private AcmeCertificateService acme;
     private final AtomicInteger httpErrors = new AtomicInteger();
     private final MaintenanceService maintenance;
@@ -65,8 +73,7 @@ public final class WebPanelServer {
             acme.validateConfiguration();
             // HTTP-01 validation needs a live HTTP listener before Certbot can request the challenge URL.
             activeMode = "HTTP";
-            PanelWebApplication.setDelegate(this);
-            startSpringContext(false);
+            startWebServer(false);
             int hours = Math.max(6, Math.min(168, config.acmeRenewalCheckHours()));
             proxy.getScheduler().buildTask(getPluginOwner(), this::checkAcmeRenewal)
                     .repeat(hours, TimeUnit.HOURS).schedule();
@@ -88,20 +95,18 @@ public final class WebPanelServer {
             }
             if (activeMode.equals("BOTH") && config.httpPort() == config.httpsPort()) throw new IllegalStateException("HTTP and HTTPS ports must differ in BOTH mode");
             try {
-                PanelWebApplication.setDelegate(this);
-                if (activeMode.equals("HTTP") || activeMode.equals("BOTH")) startSpringContext(false);
-                if (activeMode.equals("HTTPS") || activeMode.equals("BOTH")) startSpringContext(true);
+                if (activeMode.equals("HTTP") || activeMode.equals("BOTH")) startWebServer(false);
+                if (activeMode.equals("HTTPS") || activeMode.equals("BOTH")) startWebServer(true);
             } catch (Exception e) {
-                stop();
+                stopListeners();
                 if (requestedMode.equals("AUTO") && tlsMaterial != null) {
                     logger.warn("TLS material was discovered but HTTPS could not start. Falling back to HTTP on port {}. Check certificate/key matching, permissions and certificate chain.", config.httpPort(), e);
                     activeMode = "HTTP";
-                    PanelWebApplication.setDelegate(this);
-                    startSpringContext(false);
+                    startWebServer(false);
                 } else throw e;
             }
         }
-        if (springContexts.isEmpty()) throw new IllegalStateException("No Spring Boot web listener started.");
+        if (webServers.isEmpty()) throw new IllegalStateException("No web listener started.");
         long interval = Math.max(5, config.sampleSeconds());
         proxy.getScheduler().buildTask(getPluginOwner(), () -> {
             db.sampleMetric(proxy.getPlayerCount(), proxy.getAllServers().size(), Math.max(0, Instant.now().getEpochSecond() - startedAt.getEpochSecond()));
@@ -128,20 +133,20 @@ public final class WebPanelServer {
             lastCertificateFingerprint = certificateFingerprint(next);
             if (!changed) return;
             TlsCertificateDetector.Material previous = tlsMaterial;
-            ConfigurableApplicationContext old = springContexts.remove(true);
-            if (old != null) old.close();
+            HttpServer old = webServers.remove(true);
+            if (old != null) old.stop(0);
             tlsMaterial = next;
             try {
-                startSpringContext(true);
-                activeMode = springContexts.containsKey(false) ? "BOTH" : "HTTPS";
+                startWebServer(true);
+                activeMode = webServers.containsKey(false) ? "BOTH" : "HTTPS";
                 logger.info("HTTPS listener loaded/reloaded with the ACME certificate (expires {}).", next.expiresAt());
             } catch (Exception reloadFailure) {
                 tlsMaterial = previous;
                 logger.error("Could not start HTTPS with the renewed certificate; attempting to restore the previous HTTPS listener.", reloadFailure);
                 if (previous != null) {
                     try {
-                        startSpringContext(true);
-                        activeMode = springContexts.containsKey(false) ? "BOTH" : "HTTPS";
+                        startWebServer(true);
+                        activeMode = webServers.containsKey(false) ? "BOTH" : "HTTPS";
                         logger.warn("Previous HTTPS certificate listener restored (expires {}).", previous.expiresAt());
                     } catch (Exception restoreFailure) {
                         logger.error("Could not restore the previous HTTPS listener. HTTP may remain available if configured.", restoreFailure);
@@ -154,41 +159,91 @@ public final class WebPanelServer {
         }
     }
 
-    private void startSpringContext(boolean https) {
+    /** Starts the embedded JDK HTTP server, avoiding optional web-framework classpath discovery
+     * inside Velocity's plugin classloader. */
+    private void startWebServer(boolean https) throws Exception {
         int port = https ? config.httpsPort() : config.httpPort();
-        Map<String, Object> properties = new LinkedHashMap<>();
-        properties.put("server.port", port);
-        properties.put("server.address", config.bindAddress());
-        properties.put("server.ssl.enabled", https);
-        properties.put("spring.main.banner-mode", "off");
-        properties.put("spring.main.web-application-type", "servlet");
-        properties.put("spring.jmx.enabled", "false");
-        properties.put("server.error.include-message", "never");
-        properties.put("server.error.include-stacktrace", "never");
-        properties.put("server.shutdown", "graceful");
-        properties.put("spring.lifecycle.timeout-per-shutdown-phase", "5s");
-        properties.put("server.max-http-request-header-size", "16KB");
-        properties.put("logging.level.root", "WARN");
-        if (https) {
-            if (tlsMaterial == null) throw new IllegalStateException("HTTPS listener requested without detected TLS material");
-            if (tlsMaterial.kind() == TlsCertificateDetector.Material.Kind.PEM) {
-                properties.put("server.ssl.certificate", tlsMaterial.certificate().toString());
-                properties.put("server.ssl.certificate-private-key", tlsMaterial.privateKey().toString());
+        InetAddress bindAddress = InetAddress.getByName(config.bindAddress());
+        HttpServer server = null;
+        try {
+            if (https) {
+                if (tlsMaterial == null) throw new IllegalStateException("HTTPS listener requested without detected TLS material");
+                SSLContext sslContext = createSslContext(tlsMaterial);
+                HttpsServer secureServer = HttpsServer.create(new InetSocketAddress(bindAddress, port), 0);
+                server = secureServer;
+                secureServer.setHttpsConfigurator(new HttpsConfigurator(sslContext) {
+                    @Override public void configure(HttpsParameters parameters) {
+                        SSLParameters sslParameters = getSSLContext().getDefaultSSLParameters();
+                        sslParameters.setProtocols(new String[]{"TLSv1.3", "TLSv1.2"});
+                        parameters.setSSLParameters(sslParameters);
+                    }
+                });
             } else {
-                properties.put("server.ssl.key-store", tlsMaterial.keyStore().toString());
-                if (tlsMaterial.keyStorePassword() != null && !tlsMaterial.keyStorePassword().isEmpty()) properties.put("server.ssl.key-store-password", tlsMaterial.keyStorePassword());
-                properties.put("server.ssl.key-store-type", tlsMaterial.keyStoreType());
+                server = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
             }
-            properties.put("server.ssl.enabled-protocols", "TLSv1.3,TLSv1.2");
+            server.createContext("/", this::handleExchange);
+            server.setExecutor(webExecutor);
+            server.start();
+            HttpServer previous = webServers.put(https, server);
+            if (previous != null && previous != server) previous.stop(0);
+            logger.info("Vertex Velocity Web Panel {} listener started on {}:{}",
+                    https ? "HTTPS" : "HTTP", config.bindAddress(), port);
+        } catch (Exception failure) {
+            if (server != null) try { server.stop(0); } catch (Exception ignored) { }
+            throw failure;
         }
-        ConfigurableApplicationContext context = new SpringApplicationBuilder(PanelWebApplication.class)
-                .web(WebApplicationType.SERVLET)
-                .registerShutdownHook(false)
-                .properties(properties)
-                .run();
-        springContexts.put(https, context);
-        logger.info("Vertex Web Panel Spring Boot {} listener started on {}:{}",
-                https ? "HTTPS" : "HTTP", config.bindAddress(), port);
+    }
+
+    private SSLContext createSslContext(TlsCertificateDetector.Material material) throws Exception {
+        char[] password = randomToken().toCharArray();
+        KeyStore keyStore;
+        if (material.kind() == TlsCertificateDetector.Material.Kind.KEYSTORE) {
+            keyStore = KeyStore.getInstance(material.keyStoreType());
+            Path path = material.keyStore();
+            char[] configuredPassword = material.keyStorePassword() == null ? new char[0] : material.keyStorePassword().toCharArray();
+            try (InputStream input = Files.newInputStream(path)) {
+                try { keyStore.load(input, configuredPassword); }
+                catch (Exception firstFailure) {
+                    try (InputStream retry = Files.newInputStream(path)) { keyStore.load(retry, null); }
+                }
+            }
+            password = configuredPassword;
+        } else {
+            CertificateFactory certificateFactory = CertificateFactory.getInstance("X.509");
+            Collection<? extends Certificate> parsedCertificates;
+            try (InputStream certInput = Files.newInputStream(material.certificate())) {
+                parsedCertificates = certificateFactory.generateCertificates(certInput);
+            }
+            if (parsedCertificates.isEmpty()) throw new IllegalArgumentException("TLS certificate file contains no X.509 certificates");
+            Certificate[] chain = parsedCertificates.toArray(Certificate[]::new);
+            PrivateKey privateKey = readPkcs8PrivateKey(material.privateKey());
+            if (privateKey == null) throw new IllegalArgumentException("TLS private key must be an unencrypted PKCS#8 PEM key");
+            keyStore = KeyStore.getInstance("PKCS12");
+            keyStore.load(null, password);
+            keyStore.setKeyEntry("vertex-panel", privateKey, password, chain);
+        }
+        KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        keyManagers.init(keyStore, password);
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(keyManagers.getKeyManagers(), null, new java.security.SecureRandom());
+        return sslContext;
+    }
+
+    private PrivateKey readPkcs8PrivateKey(Path path) throws Exception {
+        String pem = Files.readString(path, StandardCharsets.US_ASCII).trim();
+        String marker = "-----BEGIN PRIVATE KEY-----";
+        String endMarker = "-----END PRIVATE KEY-----";
+        if (!pem.contains(marker) || !pem.contains(endMarker)) {
+            throw new IllegalArgumentException("Unsupported TLS private key format: expected unencrypted PKCS#8 PEM");
+        }
+        String encoded = pem.substring(pem.indexOf(marker) + marker.length(), pem.indexOf(endMarker)).replaceAll("\\s", "");
+        byte[] keyBytes = Base64.getDecoder().decode(encoded);
+        Exception lastFailure = null;
+        for (String algorithm : List.of("RSA", "EC", "Ed25519", "DSA")) {
+            try { return KeyFactory.getInstance(algorithm).generatePrivate(new PKCS8EncodedKeySpec(keyBytes)); }
+            catch (Exception failure) { lastFailure = failure; }
+        }
+        throw new IllegalArgumentException("Could not parse TLS private key", lastFailure);
     }
 
     private Object pluginOwner;
@@ -215,7 +270,7 @@ public final class WebPanelServer {
             }
             if(path.equals("/")||path.equals("/index.html")){serveResource(x,"/web/index.html","text/html; charset=utf-8");return;}
             if(path.startsWith("/assets/")){serveResource(x,"/web"+path,"text/plain; charset=utf-8");return;}
-            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","4.0.0","timestamp",Instant.now().getEpochSecond()));return;}
+            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","4.0.1","timestamp",Instant.now().getEpochSecond()));return;}
             if(path.equals("/api/v1/setup-status")&&method.equals("GET")){json(x,200,Map.of("needsSetup",db.userCount()==0));return;}
             if(path.equals("/api/v1/setup")&&method.equals("POST")){setup(x);return;}
             if(path.equals("/api/v1/login")&&method.equals("POST")){login(x);return;}
@@ -829,14 +884,20 @@ public final class WebPanelServer {
     private void serveResource(HttpExchange x,String resource,String type)throws IOException{try(InputStream in=getClass().getResourceAsStream(resource)){if(in==null){json(x,404,Map.of("error","Resource not found"));return;}byte[] b=in.readAllBytes();x.getResponseHeaders().set("Content-Type",type);x.sendResponseHeaders(200,b.length);x.getResponseBody().write(b);}}
     private void json(HttpExchange x,int status,Object data)throws IOException{byte[] b=gson.toJson(data).getBytes(StandardCharsets.UTF_8);x.getResponseHeaders().set("Content-Type","application/json; charset=utf-8");x.sendResponseHeaders(status,b.length);x.getResponseBody().write(b);}
     private void safeJson(HttpExchange x,int status,Object data){try{json(x,status,data);}catch(Exception ignored){}}
-    public void stop() {
-        for (ConfigurableApplicationContext context : springContexts.values()) {
-            try { context.close(); } catch (Exception e) { logger.warn("Failed to stop Spring Boot panel context cleanly", e); }
+    private void stopListeners() {
+        for (HttpServer server : webServers.values()) {
+            try { server.stop(0); } catch (Exception e) { logger.warn("Failed to stop web panel listener cleanly", e); }
         }
-        springContexts.clear();
-        PanelWebApplication.clearDelegate(this);
+        webServers.clear();
+    }
+
+    public void stop() {
+        stopListeners();
+        webExecutor.shutdownNow();
         sessions.clear();
         pendingLogins.clear();
+        loginAttempts.clear();
+        failedLogins.clear();
     }
     private record Session(String username,String role,long expiresAt,boolean apiKey,boolean apiWrite){}
     private record FailureState(int failures,long blockedUntil,long lastFailure){}

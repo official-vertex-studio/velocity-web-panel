@@ -1,4 +1,4 @@
-# Vertex Velocity Web Panel 4.0.0 — primary configuration
+# Vertex Velocity Web Panel 4.0.1 — primary configuration
 web-panel:
   enabled: true
   # HTTP is the safe default for first setup. Configure TLS before switching to HTTPS/BOTH.

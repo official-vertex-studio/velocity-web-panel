@@ -8,8 +8,7 @@ The Java code is grouped by responsibility:
 - `db` — SQLite persistence and schema operations.
 - `security` — password hashing, TOTP and authentication primitives.
 - `service` — business logic independent from HTTP transport (maintenance state is persisted by `MaintenanceService`).
-- `spring` — Spring MVC hosting and compatibility adapter.
-- `web` — HTTP routing, response serialization and existing panel integration.
+- `web/WebPanelServer.java` — embedded JDK HTTP/HTTPS listener, routing, response serialization and API authorization.
 
 ## Runtime configuration
 
@@ -25,7 +24,7 @@ The JAR's `src/main/resources/defaults/` files are templates only. Runtime setti
 Changes are persisted atomically in `maintenance.yml` and audit logged. During maintenance, a new connection is allowed only when whitelist enforcement is enabled and its UUID is on the whitelist. Disabling whitelist enforcement therefore blocks all new connections. If `allow-existing-players` is true, an already-connected UUID can pass a duplicate/reconnect pre-login check; `kick-existing-players` disconnects connected players who are no longer allowed when maintenance settings or whitelist membership change.
 
 
-## 2.0.0 implementation layout
+## 4.0.1 implementation layout
 
 ```text
 src/main/java/fr/vertexvelocity/webpanel/
@@ -42,8 +41,7 @@ src/main/java/fr/vertexvelocity/webpanel/
 │   ├── MaintenanceService.java       # State, messages and UUID whitelist
 │   ├── MotdService.java              # Normal/maintenance server-list MOTD
 │   └── TlsCertificateDetector.java   # TLS material discovery and validation
-├── spring/                           # Embedded Spring Boot bridge
-└── web/WebPanelServer.java            # HTTP API routing and authorization
+└── web/WebPanelServer.java           # Embedded JDK HTTP/HTTPS server + API routes
 
 src/main/resources/
 ├── defaults/config.yml               # Main config template
