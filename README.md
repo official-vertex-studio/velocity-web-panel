@@ -27,7 +27,7 @@ Vertex Velocity Web Panel brings proxy operations, backend management, player in
 
 ## Installation
 
-1. Download `vertex-velocity-web-panel-4.0.1.jar` from the GitHub Release **Assets**.
+1. Download `vertex-velocity-web-panel-4.3.0.jar` from the GitHub Release **Assets**.
 2. Place the JAR in the `plugins/` directory of the Velocity proxy.
 3. Start or restart the proxy.
 4. Open the plugin's data directory and review `config.yml`.
@@ -89,7 +89,7 @@ Build with JDK 25 and Maven:
 mvn --batch-mode --no-transfer-progress clean verify
 ```
 
-The distributable plugin JAR is produced under `target/`. Install the shaded `vertex-velocity-web-panel-4.0.1.jar` in the Velocity `plugins/` directory.
+The distributable plugin JAR is produced under `target/`. Install the shaded `vertex-velocity-web-panel-4.3.0.jar` in the Velocity `plugins/` directory.
 
 ## Project
 
@@ -126,7 +126,7 @@ Runtime YAML files are stored in `plugins/vertexvelocitywebpanel/`: `config.yml`
 
 Maintenance enforcement runs at Velocity pre-login. With maintenance enabled and whitelist enforcement enabled, UUIDs not in the whitelist are denied. `allow-existing-players` controls reconnect/pre-login behavior for players already online, and `kick-existing-players` can disconnect non-whitelisted players when maintenance is enabled. The whitelist uses UUIDs as its canonical identity; the API can resolve a `playerName` only while that player is online.
 
-Authenticated API routes include `GET /api/v1/status`, `GET /api/v1/maintenance`, `GET /api/v1/maintenance/status`, `PUT /api/v1/maintenance`, `GET /api/v1/motd`, `GET /api/v1/motd/preview`, and `PUT /api/v1/motd`. API keys can be created with `scope: READ` or `scope: READ_WRITE`. Write keys can modify supported MOTD/maintenance settings and reload aliases; they do not become owner keys and cannot administer users or create/revoke API keys.
+Authenticated API routes include `GET /api/v1/status`, `GET /api/v1/maintenance`, `GET /api/v1/maintenance/status`, `PUT /api/v1/maintenance`, `GET /api/v1/motd`, `GET /api/v1/motd/preview`, and `PUT /api/v1/motd`. API keys can be created with `scope: READ` or `scope: READ_WRITE`. READ_WRITE keys can only call an explicit safe allowlist: backend probes, alert acknowledgement and predefined Command Center actions. They cannot change proxy configuration, moderate players or manage accounts, backends or API keys.
 
 With `web-panel.mode: AUTO`, TLS is discovered at startup without filling in a path. The detector checks `plugins/vertexvelocitywebpanel/tls/`, the plugin data folder, `./tls`, common Let's Encrypt/system certificate directories, and additional roots in `tls.yml`. Supported PEM pairs include `fullchain.pem` + `privkey.pem` and `tls.crt` + `tls.key`; existing PKCS12/PFX/JKS keystores are also detected. PEM certificates do not require a keystore password. HTTPS uses the configured HTTPS port (8443 by default).
 
@@ -157,3 +157,21 @@ This is a Certbot-backed integration, not a bundled ACME protocol implementation
 ## Release validation and limitations
 
 See [`docs/REMAINING-VALIDATION.md`](docs/REMAINING-VALIDATION.md) for TOTP recovery-code behavior, ACME deployment requirements, settings that require a Velocity restart, and the mandatory Java 25 / real-proxy release checklist. The checklist is not evidence that those tests have already passed.
+
+
+## 🚨 Operations & Reliability 4.2
+
+- Persistent backend alerts with configurable latency thresholds, cooldowns and retention.
+- Monitoring policy controls and alert acknowledgement.
+- Safe diagnostic actions; no arbitrary console or operating-system command runner.
+- Global search, player/backend CSV exports and OpenAPI API documentation.
+- Consistent SQLite snapshots with authenticated owner-only download.
+- Browser sessions are revalidated against account disablement and role changes.
+
+
+## Operations & Support 4.3
+
+- Added a downloadable sanitized JSON support bundle for owner/administrator troubleshooting.
+- Restricted `READ_WRITE` API keys to an explicit allowlist of safe operations; they no longer inherit administrator identity or configuration permissions.
+- Expanded diagnostic metadata while omitting backend addresses, credential material, webhook URLs and filesystem paths.
+- Improved audit and player-history export limits and hardened backup permission fallback behavior.

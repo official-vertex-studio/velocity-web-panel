@@ -36,6 +36,8 @@ public final class PanelDatabase implements AutoCloseable {
             s.execute("CREATE INDEX IF NOT EXISTS idx_events_player_time ON events(uuid,created_at)");
             s.execute("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT, action TEXT NOT NULL, target TEXT, ip TEXT, details TEXT, created_at INTEGER NOT NULL)");
             s.execute("CREATE TABLE IF NOT EXISTS api_keys(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, last_used INTEGER, revoked INTEGER NOT NULL DEFAULT 0, scope TEXT NOT NULL DEFAULT 'READ')");
+            s.execute("CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY AUTOINCREMENT, severity TEXT NOT NULL, source TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN', created_at INTEGER NOT NULL, acknowledged_at INTEGER, acknowledged_by TEXT)");
+            s.execute("CREATE INDEX IF NOT EXISTS idx_alerts_status_created ON alerts(status,created_at)");
             try { s.execute("ALTER TABLE api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'READ'"); } catch (SQLException ignored) { /* Existing database already has the column. */ }
         }
     }
@@ -101,10 +103,10 @@ public final class PanelDatabase implements AutoCloseable {
     }
     public synchronized void sampleMetric(int players,int backends,long uptime) { try(PreparedStatement p=connection.prepareStatement("INSERT INTO metrics(online_players,backend_count,uptime_seconds,sampled_at) VALUES(?,?,?,?)")){p.setInt(1,players);p.setInt(2,backends);p.setLong(3,uptime);p.setLong(4,Instant.now().getEpochSecond());p.executeUpdate();}catch(SQLException ignored){} }
     public synchronized List<Map<String,Object>> events(int limit) throws SQLException {
-        List<Map<String,Object>> out=new ArrayList<>(); try(PreparedStatement p=connection.prepareStatement("SELECT event_type,uuid,username,server_name,details,created_at FROM events ORDER BY id DESC LIMIT ?")){p.setInt(1,Math.max(1,Math.min(500,limit)));try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object>m=new LinkedHashMap<>();m.put("type",r.getString(1));m.put("uuid",r.getString(2));m.put("username",r.getString(3));m.put("server",r.getString(4));m.put("details",r.getString(5));m.put("timestamp",r.getLong(6));out.add(m);}}}return out;
+        List<Map<String,Object>> out=new ArrayList<>(); try(PreparedStatement p=connection.prepareStatement("SELECT event_type,uuid,username,server_name,details,created_at FROM events ORDER BY id DESC LIMIT ?")){p.setInt(1,Math.max(1,Math.min(5000,limit)));try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object>m=new LinkedHashMap<>();m.put("type",r.getString(1));m.put("uuid",r.getString(2));m.put("username",r.getString(3));m.put("server",r.getString(4));m.put("details",r.getString(5));m.put("timestamp",r.getLong(6));out.add(m);}}}return out;
     }
     public synchronized List<Map<String,Object>> metrics(int limit) throws SQLException {
-        List<Map<String,Object>> out=new ArrayList<>();try(PreparedStatement p=connection.prepareStatement("SELECT online_players,backend_count,uptime_seconds,sampled_at FROM metrics ORDER BY id DESC LIMIT ?")){p.setInt(1,Math.max(1,Math.min(2000,limit)));try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object>m=new LinkedHashMap<>();m.put("players",r.getInt(1));m.put("backends",r.getInt(2));m.put("uptimeSeconds",r.getLong(3));m.put("timestamp",r.getLong(4));out.add(m);}}}Collections.reverse(out);return out;
+        List<Map<String,Object>> out=new ArrayList<>();try(PreparedStatement p=connection.prepareStatement("SELECT online_players,backend_count,uptime_seconds,sampled_at FROM metrics ORDER BY id DESC LIMIT ?")){p.setInt(1,Math.max(1,Math.min(10000,limit)));try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object>m=new LinkedHashMap<>();m.put("players",r.getInt(1));m.put("backends",r.getInt(2));m.put("uptimeSeconds",r.getLong(3));m.put("timestamp",r.getLong(4));out.add(m);}}}Collections.reverse(out);return out;
     }
     public synchronized void sampleBackendMetric(String server, String status, long latencyMs, long sampledAt) {
         if(connection==null)return;
@@ -113,13 +115,23 @@ public final class PanelDatabase implements AutoCloseable {
         }catch(SQLException ignored){}
     }
     public synchronized List<Map<String,Object>> playerDirectory(String search,int limit) throws SQLException {
-        String q=search==null?"":search.trim().toLowerCase(Locale.ROOT); int safeLimit=Math.max(1,Math.min(500,limit));
+        String q=search==null?"":search.trim().toLowerCase(Locale.ROOT); int safeLimit=Math.max(1,Math.min(2000,limit));
         List<Map<String,Object>> out=new ArrayList<>();
         String sql="SELECT uuid, MAX(username) username, COUNT(CASE WHEN event_type='LOGIN' THEN 1 END) logins, MIN(created_at) first_seen, MAX(created_at) last_seen, COUNT(CASE WHEN event_type='SERVER_SWITCH' THEN 1 END) transfers, COUNT(CASE WHEN event_type LIKE '%ERROR%' OR event_type LIKE '%FAILED%' THEN 1 END) errors FROM events WHERE uuid IS NOT NULL AND (?='' OR lower(username) LIKE ? OR lower(uuid) LIKE ?) GROUP BY uuid ORDER BY last_seen DESC LIMIT ?";
         try(PreparedStatement p=connection.prepareStatement(sql)){p.setString(1,q);p.setString(2,"%"+q+"%");p.setString(3,"%"+q+"%");p.setInt(4,safeLimit);try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object> m=new LinkedHashMap<>();m.put("uuid",r.getString("uuid"));m.put("username",r.getString("username"));m.put("loginCount",r.getLong("logins"));m.put("firstSeen",r.getLong("first_seen"));m.put("lastSeen",r.getLong("last_seen"));long spanDays=Math.max(1,(r.getLong("last_seen")-r.getLong("first_seen"))/86400L+1);m.put("loginsPerWeek",Math.round(r.getLong("logins")*7.0/spanDays*100.0)/100.0);m.put("transferCount",r.getLong("transfers"));m.put("errorCount",r.getLong("errors"));m.put("sessionCount",r.getLong("logins"));out.add(m);}}}
         for(Map<String,Object> player:out){Map<String,Object> profile=playerProfile(String.valueOf(player.get("uuid")),50);player.put("username",profile.get("username"));player.put("totalPlaySeconds",profile.get("totalPlaySeconds"));player.put("averageSessionSeconds",profile.get("averageSessionSeconds"));player.put("serversVisited",profile.get("serversVisited"));}
         return out;
     }
+    public synchronized List<Map<String,Object>> playerDirectoryExport(int limit) throws SQLException {
+        List<Map<String,Object>> out=new ArrayList<>();
+        String sql="SELECT uuid,MAX(username) username,COUNT(CASE WHEN event_type='LOGIN' THEN 1 END) logins,MIN(created_at) first_seen,MAX(created_at) last_seen FROM events WHERE uuid IS NOT NULL GROUP BY uuid ORDER BY last_seen DESC LIMIT ?";
+        try(PreparedStatement p=connection.prepareStatement(sql)){
+            p.setInt(1,Math.max(1,Math.min(5000,limit)));
+            try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object> row=new LinkedHashMap<>();row.put("uuid",r.getString("uuid"));row.put("username",r.getString("username"));row.put("loginCount",r.getLong("logins"));row.put("firstSeen",r.getLong("first_seen"));row.put("lastSeen",r.getLong("last_seen"));out.add(row);}}
+        }
+        return out;
+    }
+
     public synchronized Map<String,Object> playerProfile(String uuid,int limit) throws SQLException {
         List<Map<String,Object>> history=new ArrayList<>(); Set<String> visited=new TreeSet<>(String.CASE_INSENSITIVE_ORDER); long totalSeconds=0,completed=0,allLogins=0,allTransfers=0,allErrors=0,firstSeen=0; long lastLogin=0,lastSeen=0;String latestName="Unknown";
         try(PreparedStatement p=connection.prepareStatement("SELECT event_type,username,server_name,details,created_at FROM events WHERE uuid=? ORDER BY created_at DESC,id DESC LIMIT ?")){p.setString(1,uuid);p.setInt(2,Math.max(1,Math.min(500,limit)));try(ResultSet r=p.executeQuery()){while(r.next()){String type=r.getString(1),name=r.getString(2),server=r.getString(3),details=r.getString(4);long ts=r.getLong(5);if(name!=null&&!name.isBlank()&&"Unknown".equals(latestName))latestName=name;if(ts>lastSeen)lastSeen=ts;if(server!=null&&!server.isBlank()&&!server.equals("null")&&!server.startsWith("BACKEND_"))visited.add(server);Map<String,Object> e=new LinkedHashMap<>();e.put("type",type);e.put("username",name);e.put("server",server);e.put("details",details);e.put("timestamp",ts);history.add(e);}}}
@@ -145,10 +157,120 @@ public final class PanelDatabase implements AutoCloseable {
     }
     private long scalar(String sql,long... args) throws SQLException {try(PreparedStatement p=connection.prepareStatement(sql)){for(int i=0;i<args.length;i++)p.setLong(i+1,args[i]);try(ResultSet r=p.executeQuery()){return r.next()?r.getLong(1):0;}}}
     private Object nullableLong(ResultSet r,int col)throws SQLException{long n=r.getLong(col);return r.wasNull()?null:n;}
+    public synchronized List<Map<String,Object>> backendMetrics(int limit) throws SQLException {
+        List<Map<String,Object>> out=new ArrayList<>();
+        try(PreparedStatement p=connection.prepareStatement("SELECT server_name,status,latency_ms,sampled_at FROM backend_metrics ORDER BY id DESC LIMIT ?")){
+            p.setInt(1,Math.max(1,Math.min(10000,limit)));
+            try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object> row=new LinkedHashMap<>();row.put("server",r.getString(1));row.put("status",r.getString(2));long latency=r.getLong(3);row.put("latencyMs",r.wasNull()?null:latency);row.put("timestamp",r.getLong(4));out.add(row);}}
+        }
+        return out;
+    }
+
     public synchronized List<Map<String,Object>> auditLogs(int limit) throws SQLException {
-        List<Map<String,Object>> out=new ArrayList<>();try(PreparedStatement p=connection.prepareStatement("SELECT actor,action,target,ip,details,created_at FROM audit ORDER BY id DESC LIMIT ?")){p.setInt(1,Math.max(1,Math.min(500,limit)));try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object>m=new LinkedHashMap<>();m.put("actor",r.getString(1));m.put("action",r.getString(2));m.put("target",r.getString(3));m.put("ip",r.getString(4));m.put("details",r.getString(5));m.put("timestamp",r.getLong(6));out.add(m);}}}return out;
+        List<Map<String,Object>> out=new ArrayList<>();try(PreparedStatement p=connection.prepareStatement("SELECT actor,action,target,ip,details,created_at FROM audit ORDER BY id DESC LIMIT ?")){p.setInt(1,Math.max(1,Math.min(5000,limit)));try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object>m=new LinkedHashMap<>();m.put("actor",r.getString(1));m.put("action",r.getString(2));m.put("target",r.getString(3));m.put("ip",r.getString(4));m.put("details",r.getString(5));m.put("timestamp",r.getLong(6));out.add(m);}}}return out;
     }
     public synchronized void prune(int retentionDays) { long cutoff=Instant.now().minusSeconds(Math.max(1,retentionDays)*86400L).getEpochSecond(); try(PreparedStatement p=connection.prepareStatement("DELETE FROM metrics WHERE sampled_at<?")){p.setLong(1,cutoff);p.executeUpdate();}catch(SQLException ignored){} try(PreparedStatement p=connection.prepareStatement("DELETE FROM events WHERE created_at<?")){p.setLong(1,cutoff);p.executeUpdate();}catch(SQLException ignored){} try(PreparedStatement p=connection.prepareStatement("DELETE FROM backend_metrics WHERE sampled_at<?")){p.setLong(1,cutoff);p.executeUpdate();}catch(SQLException ignored){} }
+
+    public synchronized void pruneAlerts(int maxRows) throws SQLException {
+        int keep = Math.max(100, Math.min(10000, maxRows));
+        try (PreparedStatement p = connection.prepareStatement(
+                "DELETE FROM alerts WHERE status='ACKNOWLEDGED' AND id NOT IN (SELECT id FROM alerts WHERE status='ACKNOWLEDGED' ORDER BY id DESC LIMIT ?)")) {
+            p.setInt(1, keep); p.executeUpdate();
+        }
+    }
+
+    public synchronized long createAlert(String severity, String source, String title, String message) throws SQLException {
+        String safeSeverity = Set.of("INFO", "WARNING", "CRITICAL").contains(severity) ? severity : "WARNING";
+        try (PreparedStatement p = connection.prepareStatement(
+                "INSERT INTO alerts(severity,source,title,message,status,created_at) VALUES(?,?,?,?, 'OPEN', ?)",
+                Statement.RETURN_GENERATED_KEYS)) {
+            p.setString(1, safeSeverity); p.setString(2, limitText(source, 64));
+            p.setString(3, limitText(title, 160)); p.setString(4, limitText(message, 1500));
+            p.setLong(5, Instant.now().getEpochSecond()); p.executeUpdate();
+            try (Statement id = connection.createStatement(); ResultSet row = id.executeQuery("SELECT last_insert_rowid()")) {
+                return row.next() ? row.getLong(1) : -1L;
+            }
+        }
+    }
+
+    public synchronized List<Map<String,Object>> alerts(int limit, String status) throws SQLException {
+        List<Map<String,Object>> out = new ArrayList<>();
+        String normalized = status == null ? "ALL" : status.trim().toUpperCase(Locale.ROOT);
+        if (!Set.of("ALL", "OPEN", "ACKNOWLEDGED").contains(normalized)) normalized = "ALL";
+        String sql = "SELECT id,severity,source,title,message,status,created_at,acknowledged_at,acknowledged_by FROM alerts "
+                + (normalized.equals("ALL") ? "" : "WHERE status=? ") + "ORDER BY id DESC LIMIT ?";
+        try (PreparedStatement p = connection.prepareStatement(sql)) {
+            int index = 1; if (!normalized.equals("ALL")) p.setString(index++, normalized);
+            p.setInt(index, Math.max(1, Math.min(500, limit)));
+            try (ResultSet r = p.executeQuery()) {
+                while (r.next()) {
+                    Map<String,Object> row = new LinkedHashMap<>();
+                    row.put("id", r.getLong(1)); row.put("severity", r.getString(2)); row.put("source", r.getString(3));
+                    row.put("title", r.getString(4)); row.put("message", r.getString(5)); row.put("status", r.getString(6));
+                    row.put("createdAt", r.getLong(7)); row.put("acknowledgedAt", nullableLong(r, 8)); row.put("acknowledgedBy", r.getString(9));
+                    out.add(row);
+                }
+            }
+        }
+        return out;
+    }
+
+    public synchronized boolean acknowledgeAlert(long id, String username) throws SQLException {
+        try (PreparedStatement p = connection.prepareStatement(
+                "UPDATE alerts SET status='ACKNOWLEDGED', acknowledged_at=?, acknowledged_by=? WHERE id=? AND status='OPEN'")) {
+            p.setLong(1, Instant.now().getEpochSecond()); p.setString(2, username); p.setLong(3, id);
+            return p.executeUpdate() == 1;
+        }
+    }
+
+    public synchronized int acknowledgeAllAlerts(String username) throws SQLException {
+        try (PreparedStatement p = connection.prepareStatement(
+                "UPDATE alerts SET status='ACKNOWLEDGED', acknowledged_at=?, acknowledged_by=? WHERE status='OPEN'")) {
+            p.setLong(1, Instant.now().getEpochSecond()); p.setString(2, username); return p.executeUpdate();
+        }
+    }
+
+    public synchronized Map<String,Object> alertCounts() throws SQLException {
+        Map<String,Object> counts = new LinkedHashMap<>();
+        try (Statement s = connection.createStatement(); ResultSet r = s.executeQuery(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),0), COALESCE(SUM(CASE WHEN severity='CRITICAL' AND status='OPEN' THEN 1 ELSE 0 END),0) FROM alerts")) {
+            if (r.next()) { counts.put("total", r.getLong(1)); counts.put("open", r.getLong(2)); counts.put("criticalOpen", r.getLong(3)); }
+        }
+        return counts;
+    }
+
+    public synchronized boolean healthCheck() {
+        if (connection == null) return false;
+        try (Statement s = connection.createStatement(); ResultSet r = s.executeQuery("PRAGMA quick_check")) {
+            return r.next() && "ok".equalsIgnoreCase(r.getString(1));
+        } catch (SQLException e) { return false; }
+    }
+
+    /** Creates a consistent SQLite snapshot without copying a live WAL database file. */
+    public synchronized Path backupTo(Path target) throws SQLException, java.io.IOException {
+        if (connection == null) throw new SQLException("Database is not initialized");
+        Path absolute = target.toAbsolutePath().normalize();
+        java.nio.file.Files.createDirectories(absolute.getParent());
+        if (java.nio.file.Files.exists(absolute)) throw new java.io.IOException("Backup already exists");
+        String escaped = absolute.toString().replace("'", "''");
+        try (Statement s = connection.createStatement()) {
+            s.execute("VACUUM INTO '" + escaped + "'");
+        } catch (SQLException failure) {
+            java.nio.file.Files.deleteIfExists(absolute);
+            throw failure;
+        }
+        if (!java.nio.file.Files.isRegularFile(absolute) || java.nio.file.Files.size(absolute) < 100) {
+            java.nio.file.Files.deleteIfExists(absolute);
+            throw new java.io.IOException("SQLite backup did not produce a valid file");
+        }
+        return absolute;
+    }
+
+    private static String limitText(String text, int max) {
+        String value = text == null ? "" : text;
+        return value.length() <= max ? value : value.substring(0, max);
+    }
+
     public synchronized boolean createApiKey(String name,String keyHash,String createdBy,String scope) throws SQLException {
         if(name==null || !name.matches("[A-Za-z0-9 _.-]{3,48}") || !Set.of("READ", "READ_WRITE").contains(scope)) return false;
         try(PreparedStatement p=connection.prepareStatement("INSERT INTO api_keys(name,key_hash,created_by,created_at,scope) VALUES(?,?,?,?,?)")) { p.setString(1,name);p.setString(2,keyHash);p.setString(3,createdBy);p.setLong(4,Instant.now().getEpochSecond());p.setString(5,scope);p.executeUpdate();return true; } catch(SQLException e) { return false; }

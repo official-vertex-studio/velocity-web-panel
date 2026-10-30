@@ -4,7 +4,7 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>fr.vertexvelocity</groupId>
   <artifactId>vertex-velocity-web-panel</artifactId>
-  <version>4.0.0</version>
+  <version>4.3.0</version>
   <name>Vertex Velocity Web Panel</name>
   <properties>
     <maven.compiler.release>25</maven.compiler.release>

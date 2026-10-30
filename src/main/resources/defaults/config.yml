@@ -1,4 +1,4 @@
-# Vertex Velocity Web Panel 4.0.1 — primary configuration
+# Vertex Velocity Web Panel 4.3.0 — primary configuration
 web-panel:
   enabled: true
   # HTTP is the safe default for first setup. Configure TLS before switching to HTTPS/BOTH.
@@ -24,6 +24,11 @@ statistics:
   sample-seconds: 15
   retention-days: 30
   backend-connect-timeout-ms: 1500
+monitoring:
+  high-latency-ms: 1000
+  alert-cooldown-seconds: 300
+  alert-history-limit: 1000
+
 discord:
   enabled: false
   webhook-url: ''

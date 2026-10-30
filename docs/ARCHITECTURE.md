@@ -57,14 +57,14 @@ The `defaults/*.yml` files are the single source of truth for newly generated co
 
 - `GET /api/v1/status` — authenticated combined snapshot of stats, MOTD, maintenance, TLS detection and server count.
 - `GET /api/v1/motd` and `GET /api/v1/motd/preview` — current MOTD configuration and selected profile.
-- `PUT /api/v1/motd` — validate, atomically persist and apply MOTD configuration immediately (owner/admin browser session or a `READ_WRITE` API key).
+- `PUT /api/v1/motd` — validate, atomically persist and apply MOTD configuration immediately (owner/admin browser session only).
 - `GET /api/v1/maintenance` and `GET /api/v1/maintenance/status` — maintenance state, UUID whitelist size and online counts.
-- `PUT /api/v1/maintenance` — update maintenance state and messages; if configured, immediately disconnect connected players who are no longer allowed.
-- `POST /api/v1/maintenance/whitelist` with `{ "uuid": "..." }`, or `{ "playerName": "..." }` for an online player.
+- `PUT /api/v1/maintenance` — owner/admin browser session only; update maintenance state and messages and, if configured, immediately disconnect connected players who are no longer allowed.
+- `POST /api/v1/maintenance/whitelist` with `{ "uuid": "..." }`, or `{ "playerName": "..." }` for an online player (owner/admin browser session only).
 - `POST` / `DELETE /api/v1/maintenance/whitelist/{uuid}` — add/remove a UUID.
 - `POST /api/v1/aliases/reload` — reload aliases from `aliases.yml`.
 
-All management endpoints require authentication. API keys have explicit `READ` or `READ_WRITE` scope; write-capable keys are intended for automation and should be kept separate from owner credentials.
+All management endpoints require authentication. API keys have explicit `READ` or `READ_WRITE` scope. `READ_WRITE` keys do not inherit administrator identity and are limited to backend probes, alert acknowledgements and the predefined safe Command Center actions (`probe_backends`, `reload_aliases`, `database_check`). Configuration changes and player moderation require an authorized interactive browser session.
 
 ## TLS discovery
 

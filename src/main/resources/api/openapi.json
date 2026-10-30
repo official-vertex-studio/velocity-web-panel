@@ -1,0 +1,283 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Vertex Velocity Web Panel API",
+    "version": "4.3.0",
+    "description": "Authenticated REST API for a Velocity proxy administration panel. Use scoped bearer API keys for integrations; browser sessions use HttpOnly cookies and same-origin requests. READ_WRITE keys are limited to safe monitoring, alert acknowledgement and allowlisted command operations; they do not inherit administrator identity."
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "Vertex API key"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "security": [],
+        "summary": "Public liveness check",
+        "responses": {
+          "200": {
+            "description": "Panel process is responding"
+          }
+        }
+      }
+    },
+    "/stats": {
+      "get": {
+        "summary": "Proxy and JVM statistics",
+        "responses": {
+          "200": {
+            "description": "Current proxy statistics"
+          }
+        }
+      }
+    },
+    "/players": {
+      "get": {
+        "summary": "List connected players",
+        "parameters": [
+          {
+            "name": "server",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Connected players"
+          }
+        }
+      }
+    },
+    "/servers": {
+      "get": {
+        "summary": "List backend servers and health",
+        "responses": {
+          "200": {
+            "description": "Backend status list"
+          }
+        }
+      }
+    },
+    "/analytics": {
+      "get": {
+        "summary": "Historical analytics",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 365
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Analytics summary and samples"
+          }
+        }
+      }
+    },
+    "/monitoring": {
+      "get": {
+        "summary": "Current backend health and open alerts",
+        "responses": {
+          "200": {
+            "description": "Monitoring summary"
+          }
+        }
+      }
+    },
+    "/alerts": {
+      "get": {
+        "summary": "List monitoring alerts",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "ALL",
+                "OPEN",
+                "ACKNOWLEDGED"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Alert history"
+          }
+        }
+      }
+    },
+    "/diagnostics": {
+      "get": {
+        "summary": "Runtime diagnostics (admin only)",
+        "responses": {
+          "200": {
+            "description": "Sanitized runtime health"
+          }
+        }
+      }
+    },
+    "/search": {
+      "get": {
+        "summary": "Search players, servers and recent events",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 2,
+              "maxLength": 64
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Search results"
+          }
+        }
+      }
+    },
+    "/exports/metrics.csv": {
+      "get": {
+        "summary": "Download metric samples as CSV",
+        "responses": {
+          "200": {
+            "description": "CSV export"
+          }
+        }
+      }
+    },
+    "/exports/events.csv": {
+      "get": {
+        "summary": "Download player events as CSV",
+        "responses": {
+          "200": {
+            "description": "CSV export"
+          }
+        }
+      }
+    },
+    "/backups/database": {
+      "get": {
+        "summary": "List database snapshots (owner only)",
+        "responses": {
+          "200": {
+            "description": "Backup list"
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a consistent SQLite snapshot (owner only)",
+        "responses": {
+          "201": {
+            "description": "Backup created"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "OpenAPI specification",
+        "responses": {
+          "200": {
+            "description": "OpenAPI 3.1 document"
+          }
+        }
+      }
+    },
+    "/exports/players.csv": {
+      "get": {
+        "summary": "Export known player directory as CSV",
+        "responses": {
+          "200": {
+            "description": "CSV download"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        }
+      }
+    },
+    "/exports/backends.csv": {
+      "get": {
+        "summary": "Export backend health samples as CSV",
+        "responses": {
+          "200": {
+            "description": "CSV download"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        }
+      }
+    },
+    "/diagnostics/export": {
+      "get": {
+        "summary": "Download sanitized support diagnostics bundle (owner/admin browser session)",
+        "responses": {
+          "200": {
+            "description": "Sanitized JSON support bundle"
+          }
+        },
+        "description": "Interactive OWNER or ADMINISTRATOR browser session only. Download a sanitized support bundle."
+      }
+    }
+  }
+}

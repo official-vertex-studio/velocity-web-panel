@@ -97,6 +97,9 @@ public final class PanelConfig {
     public synchronized int sampleSeconds() { return integer(section("statistics"), "sample-seconds", 15); }
     public synchronized int retentionDays() { return integer(section("statistics"), "retention-days", 30); }
     public synchronized int backendTimeoutMs() { return integer(section("statistics"), "backend-connect-timeout-ms", 1500); }
+    public synchronized int highLatencyMs() { return integer(section("monitoring"), "high-latency-ms", 1000); }
+    public synchronized int alertCooldownSeconds() { return integer(section("monitoring"), "alert-cooldown-seconds", 300); }
+    public synchronized int alertHistoryLimit() { return integer(section("monitoring"), "alert-history-limit", 1000); }
     public synchronized boolean discordEnabled() { return bool(section("discord"), "enabled", false); }
     public synchronized String discordWebhook() { return str(section("discord"), "webhook-url", ""); }
     public synchronized void updateEditable(String mode, Integer httpPort, Integer sampleSeconds) throws IOException {
@@ -112,6 +115,7 @@ public final class PanelConfig {
         Map<String,Object> tls = child(web, "https");
         Map<String,Object> security = section("security");
         Map<String,Object> stats = section("statistics");
+        Map<String,Object> monitoring = section("monitoring");
         if (values.containsKey("mode")) {
             String mode = String.valueOf(values.get("mode")).toUpperCase(java.util.Locale.ROOT);
             if (!java.util.Set.of("AUTO", "HTTP", "HTTPS", "BOTH").contains(mode)) throw new IllegalArgumentException("Mode must be AUTO, HTTP, HTTPS or BOTH");
@@ -143,6 +147,9 @@ public final class PanelConfig {
         putBounded(values, "retentionDays", stats, "retention-days", 1, 3650);
         putBounded(values, "loginAttemptsPerMinute", security, "login-attempts-per-minute", 3, 60);
         putBounded(values, "sessionMinutes", security, "session-minutes", 5, 1440);
+        putBounded(values, "highLatencyMs", monitoring, "high-latency-ms", 100, 60000);
+        putBounded(values, "alertCooldownSeconds", monitoring, "alert-cooldown-seconds", 30, 86400);
+        putBounded(values, "alertHistoryLimit", monitoring, "alert-history-limit", 100, 10000);
         String mode = webMode();
         if (mode.equals("BOTH") && httpPort() == httpsPort()) throw new IllegalArgumentException("HTTP and HTTPS ports must be different in BOTH mode");
         if ((mode.equals("HTTPS") || mode.equals("BOTH")) && !httpsEnabled()) throw new IllegalArgumentException("Enable HTTPS before selecting HTTPS or BOTH mode");
@@ -169,7 +176,9 @@ public final class PanelConfig {
     public synchronized Map<String,Object> publicView() {
         Map<String,Object> result = new LinkedHashMap<>(); Map<String,Object> web = new LinkedHashMap<>(section("web-panel")); Map<String,Object> nestedTls = new LinkedHashMap<>(child(section("web-panel"), "https")); nestedTls.remove("keystore-password"); web.put("https", nestedTls); result.put("web-panel", web);
         Map<String,Object> tls = new LinkedHashMap<>(nestedTls); result.put("https", tls);
-        result.put("statistics", new LinkedHashMap<>(section("statistics"))); result.put("security", new LinkedHashMap<>(section("security"))); result.put("discord", Map.of("enabled", discordEnabled(), "webhook-configured", !discordWebhook().isBlank())); return result;
+        result.put("statistics", new LinkedHashMap<>(section("statistics"))); result.put("security", new LinkedHashMap<>(section("security")));
+        result.put("monitoring", new LinkedHashMap<>(section("monitoring")));
+        result.put("discord", Map.of("enabled", discordEnabled(), "webhook-configured", !discordWebhook().isBlank())); return result;
     }
     private Map<String,Object> section(String key) { Object value = root.get(key); if (!(value instanceof Map<?,?> m)) { Map<String,Object> n = new LinkedHashMap<>(); root.put(key,n); return n; } @SuppressWarnings("unchecked") Map<String,Object> cast=(Map<String,Object>)m; return cast; }
     private static Map<String,Object> child(Map<String,Object> map, String key) { Object value=map.get(key); if (value instanceof Map<?,?> m) { @SuppressWarnings("unchecked") Map<String,Object> cast=(Map<String,Object>)m; return cast; } Map<String,Object> n=new LinkedHashMap<>(); map.put(key,n); return n; }

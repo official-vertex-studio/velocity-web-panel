@@ -31,6 +31,7 @@ import java.security.cert.X509Certificate;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.sql.SQLException;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.*;
@@ -57,6 +58,8 @@ public final class WebPanelServer {
     private final MotdService motd;
     private final CommandAliasService aliases;
     private final Map<String, BackendHealth> backendHealth = new ConcurrentHashMap<>();
+    private final Map<String, Long> alertCooldowns = new ConcurrentHashMap<>();
+    private final ExecutorService alertExecutor = Executors.newSingleThreadExecutor(r -> { Thread t = new Thread(r, "vertex-web-panel-alerts"); t.setDaemon(true); return t; });
     private Path effectiveKeystore;
     private volatile TlsCertificateDetector.Material tlsMaterial;
     private String activeMode = "HTTP";
@@ -111,7 +114,9 @@ public final class WebPanelServer {
         proxy.getScheduler().buildTask(getPluginOwner(), () -> {
             db.sampleMetric(proxy.getPlayerCount(), proxy.getAllServers().size(), Math.max(0, Instant.now().getEpochSecond() - startedAt.getEpochSecond()));
             db.prune(config.retentionDays());
+            try { db.pruneAlerts(config.alertHistoryLimit()); } catch (SQLException e) { logger.warn("Could not prune alert history", e); }
             probeBackends();
+            cleanupSecurityState();
         }).repeat(interval, TimeUnit.SECONDS).schedule();
     }
 
@@ -269,8 +274,11 @@ public final class WebPanelServer {
                 }
             }
             if(path.equals("/")||path.equals("/index.html")){serveResource(x,"/web/index.html","text/html; charset=utf-8");return;}
-            if(path.startsWith("/assets/")){serveResource(x,"/web"+path,"text/plain; charset=utf-8");return;}
-            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","4.0.1","timestamp",Instant.now().getEpochSecond()));return;}
+            if(path.startsWith("/assets/")){
+                if(path.contains("..") || !path.matches("/assets/[A-Za-z0-9_./-]{1,180}")){json(x,400,Map.of("error","Invalid asset path"));return;}
+                serveResource(x,"/web"+path,"application/octet-stream");return;
+            }
+            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","4.3.0","timestamp",Instant.now().getEpochSecond()));return;}
             if(path.equals("/api/v1/setup-status")&&method.equals("GET")){json(x,200,Map.of("needsSetup",db.userCount()==0));return;}
             if(path.equals("/api/v1/setup")&&method.equals("POST")){setup(x);return;}
             if(path.equals("/api/v1/login")&&method.equals("POST")){login(x);return;}
@@ -281,8 +289,16 @@ public final class WebPanelServer {
             if(path.startsWith("/api/v1/integrations/keys/")&&method.equals("DELETE")) { Session owner=authenticate(x); if(owner==null){json(x,401,Map.of("error","Authentication required"));return;} requireOwner(x,owner); revokeApiKey(x,owner,path); return; }
             Session session=authenticate(x);
             if(session==null){json(x,401,Map.of("error","Authentication required"));return;}
-            if(session.apiKey && !method.equals("GET") && !session.apiWrite){json(x,403,Map.of("error","This API key has READ scope only"));return;}
-            if (!session.apiKey && !Set.of("GET","HEAD","OPTIONS").contains(method) && !Set.of("OWNER","ADMINISTRATOR").contains(session.role) && !path.equals("/api/v1/logout")) { json(x,403,Map.of("error","Insufficient role permissions")); return; }
+            if (session.apiKey && path.startsWith("/api/v1/2fa")) { json(x,403,Map.of("error","Two-factor account settings require a browser session")); return; }
+            if (session.apiKey && !Set.of("GET", "HEAD", "OPTIONS").contains(method)) {
+                if (!session.apiWrite || !apiKeyWriteAllowed(path, method)) {
+                    json(x, 403, Map.of("error", session.apiWrite
+                            ? "This API key scope does not allow this write operation. Use an interactive owner/admin session for configuration changes."
+                            : "This API key has READ scope only"));
+                    return;
+                }
+            }
+            if (!session.apiKey && !Set.of("GET","HEAD","OPTIONS").contains(method) && !Set.of("OWNER","ADMINISTRATOR").contains(session.role) && !(session.role.equals("MODERATOR") && path.startsWith("/api/v1/players/")) && !path.equals("/api/v1/logout")) { json(x,403,Map.of("error","Insufficient role permissions")); return; }
             if(path.equals("/api/v1/status")&&method.equals("GET")){Map<String,Object> state=new LinkedHashMap<>();state.put("ok",true);state.put("stats",stats());state.put("maintenance",maintenance.view());state.put("motd",motd.view());state.put("tls",tlsStatus());state.put("servers",proxy.getAllServers().size());json(x,200,state);return;}
             if(path.equals("/api/v1/tls")&&method.equals("GET")){json(x,200,tlsStatus());return;}
             if(path.equals("/api/v1/2fa")&&method.equals("GET")){json(x,200,Map.of("enabled",db.totpEnabled(session.username)));return;}
@@ -317,6 +333,27 @@ public final class WebPanelServer {
             if(path.equals("/api/v1/network")&&method.equals("GET")){json(x,200,networkView());return;}
             if(path.equals("/api/v1/activity")&&method.equals("GET")){json(x,200,db.events(queryInt(x,"limit",250)));return;}
             if(path.equals("/api/v1/analytics")&&method.equals("GET")){Map<String,Object> a=new LinkedHashMap<>();a.put("metrics",db.metrics(queryInt(x,"limit",240)));a.put("events",db.events(queryInt(x,"events",100)));a.put("summary",db.analyticsSummary(queryInt(x,"days",7)));json(x,200,a);return;}
+            if(path.equals("/api/v1/monitoring")&&method.equals("GET")){json(x,200,monitoringView());return;}
+            if(path.equals("/api/v1/monitoring/config")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR");json(x,200,Map.of("highLatencyMs",config.highLatencyMs(),"alertCooldownSeconds",config.alertCooldownSeconds(),"alertHistoryLimit",config.alertHistoryLimit()));return;}
+            if(path.equals("/api/v1/monitoring/config")&&method.equals("PUT")){requireOwner(x,session);Map<?,?> values=body(x);config.updateEditable(values);db.audit(session.username,"MONITORING_CONFIG_UPDATED",null,clientIp(x),"highLatencyMs="+config.highLatencyMs()+"; alertCooldownSeconds="+config.alertCooldownSeconds());json(x,200,Map.of("ok",true,"highLatencyMs",config.highLatencyMs(),"alertCooldownSeconds",config.alertCooldownSeconds(),"alertHistoryLimit",config.alertHistoryLimit()));return;}
+            if(path.equals("/api/v1/monitoring/probe")&&method.equals("POST")){requireWriteAdmin(x,session);probeBackends();db.audit(session.username,"BACKEND_PROBE_REQUESTED",null,clientIp(x),"Manual backend probe");json(x,202,Map.of("ok",true,"message","Backend probes submitted."));return;}
+            if(path.equals("/api/v1/alerts")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR","MODERATOR","VIEWER","API_WRITE");json(x,200,db.alerts(queryInt(x,"limit",100),query(x).getOrDefault("status","ALL")));return;}
+            if(path.equals("/api/v1/alerts/ack-all")&&method.equals("POST")){requireWriteAdmin(x,session);int changed=db.acknowledgeAllAlerts(session.username);db.audit(session.username,"ALERTS_ACKNOWLEDGED",null,clientIp(x),"count="+changed);json(x,200,Map.of("ok",true,"acknowledged",changed));return;}
+            if(path.matches("/api/v1/alerts/[0-9]+/ack")&&method.equals("POST")){requireWriteAdmin(x,session);String[] parts=path.split("/");long id=Long.parseLong(parts[4]);boolean changed=db.acknowledgeAlert(id,session.username);if(!changed){json(x,404,Map.of("error","Open alert not found"));return;}db.audit(session.username,"ALERT_ACKNOWLEDGED",String.valueOf(id),clientIp(x),"");json(x,200,Map.of("ok",true));return;}
+            if(path.equals("/api/v1/diagnostics")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR");json(x,200,diagnosticsView());return;}
+            if(path.equals("/api/v1/diagnostics/export")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR");jsonDownload(x,"vertex-diagnostics.json",diagnosticsBundle());return;}
+            if(path.equals("/api/v1/search")&&method.equals("GET")){json(x,200,globalSearch(query(x).getOrDefault("q","")));return;}
+            if(path.equals("/api/v1/command-center")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR");json(x,200,Map.of("actions",List.of(Map.of("id","probe_backends","label","Probe all backends","risk","LOW"),Map.of("id","reload_aliases","label","Reload command aliases","risk","LOW"),Map.of("id","database_check","label","Check database integrity","risk","LOW")),"note","Only predefined safe operations are available. Arbitrary console commands are intentionally not exposed."));return;}
+            if(path.equals("/api/v1/command-center")&&method.equals("POST")){executeSafeCommand(x,session);return;}
+            if(path.equals("/api/v1/exports/metrics.csv")&&method.equals("GET")){csv(x,"vertex-metrics.csv",metricsCsv());return;}
+            if(path.equals("/api/v1/exports/events.csv")&&method.equals("GET")){csv(x,"vertex-events.csv",eventsCsv());return;}
+            if(path.equals("/api/v1/exports/players.csv")&&method.equals("GET")){csv(x,"vertex-players.csv",playersCsv());return;}
+            if(path.equals("/api/v1/exports/backends.csv")&&method.equals("GET")){csv(x,"vertex-backends.csv",backendsCsv());return;}
+            if(path.equals("/api/v1/exports/audit.csv")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR");csv(x,"vertex-audit.csv",auditCsv());return;}
+            if(path.equals("/api/v1/backups/database")&&method.equals("GET")){requireOwner(x,session);json(x,200,databaseBackups());return;}
+            if(path.equals("/api/v1/backups/database")&&method.equals("POST")){requireOwner(x,session);createDatabaseBackup(x,session);return;}
+            if(path.startsWith("/api/v1/backups/database/")&&method.equals("GET")){requireOwner(x,session);downloadDatabaseBackup(x,path);return;}
+            if(path.equals("/api/v1/openapi.json")&&method.equals("GET")){serveResource(x,"/api/openapi.json","application/json; charset=utf-8");return;}
             if(path.equals("/api/v1/events")&&method.equals("GET")){json(x,200,db.events(queryInt(x,"limit",100)));return;}
             if(path.equals("/api/v1/audit")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR");json(x,200,db.auditLogs(queryInt(x,"limit",100)));return;}
             if(path.equals("/api/v1/config")&&method.equals("GET")){requireRole(x,session,"OWNER","ADMINISTRATOR");json(x,200,config.publicView());return;}
@@ -377,13 +414,13 @@ public final class WebPanelServer {
         Optional<UserRecord> found=db.findUser(username);
         if(found.isEmpty()||found.get().disabled()||!PasswordUtil.verify(password,found.get().salt(),found.get().passwordHash())){recordFailedLogin(ip);db.audit(username,"LOGIN_FAILED",null,ip,"Invalid credentials");json(x,401,Map.of("error","Invalid username or password"));return;}
         failedLogins.remove(ip); UserRecord user=found.get();
-        if(db.totpEnabled(user.username())){long now=Instant.now().getEpochSecond();pendingLogins.entrySet().removeIf(e->e.getValue().expiresAt<now);String challenge=randomToken();pendingLogins.put(challenge,new PendingLogin(user.username(),user.role(),now+300));json(x,202,Map.of("requiresTotp",true,"challengeId",challenge,"message","Enter the six-digit code from your authenticator app."));return;}
+        if(db.totpEnabled(user.username())){long now=Instant.now().getEpochSecond();pendingLogins.entrySet().removeIf(e->e.getValue().expiresAt<now);String challenge=randomToken();pendingLogins.put(challenge,new PendingLogin(user.username(),user.role(),now+300,ip));json(x,202,Map.of("requiresTotp",true,"challengeId",challenge,"message","Enter the six-digit code from your authenticator app."));return;}
         createSession(x,user.username(),user.role(),ip);
     }
     private void completeTotpLogin(HttpExchange x) throws Exception {
         String ip=clientIp(x);if(!allowAttempt(ip)){json(x,429,Map.of("error","Too many login attempts. Try again later."));return;} if (isProgressivelyBlocked(ip)) { json(x,429,Map.of("error","Login temporarily blocked after repeated failures.","retryAfterSeconds",retryAfter(ip))); return; }
         Map<?,?> b=body(x);String id=string(b,"challengeId","");String code=string(b,"code","");PendingLogin pending=pendingLogins.get(id);
-        if(pending==null||pending.expiresAt<Instant.now().getEpochSecond()){pendingLogins.remove(id);json(x,401,Map.of("error","Authentication challenge expired. Sign in again."));return;}
+        if(pending==null||pending.expiresAt<Instant.now().getEpochSecond()||!pending.ip.equals(ip)){pendingLogins.remove(id);json(x,401,Map.of("error","Authentication challenge expired or does not match this client. Sign in again."));return;}
         String secret=db.totpSecret(pending.username);boolean valid=secret!=null&&Totp.verify(secret,code);if(!valid&&code!=null){String normalized=code.replace("-", "").replace(" ", "").toUpperCase(Locale.ROOT);if(normalized.matches("[A-F0-9]{16}")){valid=db.consumeTotpRecoveryCode(pending.username,PanelDatabase.hashApiKey(normalized));if(valid)db.audit(pending.username,"TOTP_RECOVERY_USED",pending.username,ip,"One-time TOTP recovery code consumed");}}if(!valid){recordFailedLogin(ip);db.audit(pending.username,"LOGIN_2FA_FAILED",null,ip,"Invalid TOTP or recovery code");json(x,401,Map.of("error","Invalid authenticator or recovery code"));return;}
         failedLogins.remove(ip);
         pendingLogins.remove(id);createSession(x,pending.username,pending.role,ip);
@@ -398,10 +435,20 @@ public final class WebPanelServer {
         String authorization=x.getRequestHeaders().getFirst("Authorization");
         if(authorization!=null && authorization.startsWith("Bearer ")){
             String key=authorization.substring(7).trim();
-            if(key.startsWith("vv_live_") && key.length()>=40) try { String scope=db.authenticateApiKeyScope(PanelDatabase.hashApiKey(key)); if(scope!=null) { boolean write=scope.equals("READ_WRITE"); return new Session("api-key",write?"ADMINISTRATOR":"VIEWER",Long.MAX_VALUE,true,write); } } catch(Exception ignored) {}
+            if(key.startsWith("vv_live_") && key.length()>=40) try { String scope=db.authenticateApiKeyScope(PanelDatabase.hashApiKey(key)); if(scope!=null) { boolean write=scope.equals("READ_WRITE"); return new Session("api-key",write?"API_WRITE":"VIEWER",Long.MAX_VALUE,true,write); } } catch(Exception ignored) {}
             return null;
         }
-        String token=cookie(x,"vv_session");if(token==null)return null;Session s=sessions.get(token);if(s==null)return null;if(s.expiresAt<Instant.now().getEpochSecond()){sessions.remove(token);return null;}return s;
+        String token=cookie(x,"vv_session");if(token==null)return null;Session s=sessions.get(token);if(s==null)return null;
+        if(s.expiresAt<Instant.now().getEpochSecond()){sessions.remove(token,s);return null;}
+        try {
+            Optional<UserRecord> current=db.findUser(s.username);
+            if(current.isEmpty()||current.get().disabled()){sessions.remove(token,s);return null;}
+            if(!current.get().role().equals(s.role)){
+                Session refreshed=new Session(s.username,current.get().role(),s.expiresAt,false,false);
+                sessions.replace(token,s,refreshed);return sessions.get(token);
+            }
+        } catch(SQLException failure) { logger.warn("Could not validate the account backing a web session",failure);return null; }
+        return s;
     }
     private boolean allowAttempt(String ip){long now=System.currentTimeMillis();ArrayDeque<Long> q=loginAttempts.computeIfAbsent(ip,k->new ArrayDeque<>());synchronized(q){while(!q.isEmpty()&&now-q.peekFirst()>60_000)q.removeFirst();if(q.size()>=Math.max(3,Math.min(60,config.loginAttemptsPerMinute())))return false;q.addLast(now);return true;}}
     private void recordFailedLogin(String ip) { failedLogins.compute(ip,(k,v)-> { long now=System.currentTimeMillis(); if(v==null||now-v.lastFailure>900_000L) v=new FailureState(0,0,now); int n=v.failures+1; long delay=n<5?0:Math.min(900_000L,30_000L << Math.min(4,(n-5)/2)); return new FailureState(n,Math.max(v.blockedUntil,now+delay),now); }); }
@@ -727,6 +774,192 @@ public final class WebPanelServer {
         return matcher.find() ? matcher.group(1) : "";
     }
 
+    private void cleanupSecurityState() {
+        long now=Instant.now().getEpochSecond();
+        sessions.entrySet().removeIf(entry -> entry.getValue().expiresAt < now);
+        pendingLogins.entrySet().removeIf(entry -> entry.getValue().expiresAt < now);
+        long millis=System.currentTimeMillis();
+        failedLogins.entrySet().removeIf(entry -> millis-entry.getValue().lastFailure > 900_000L);
+        for (Map.Entry<String,ArrayDeque<Long>> entry : loginAttempts.entrySet()) {
+            ArrayDeque<Long> attempts=entry.getValue();
+            synchronized(attempts){while(!attempts.isEmpty() && millis-attempts.peekFirst()>60_000L)attempts.removeFirst();if(attempts.isEmpty())loginAttempts.remove(entry.getKey(),attempts);}
+        }
+        alertCooldowns.entrySet().removeIf(entry -> entry.getValue() < now-config.alertCooldownSeconds()*4L);
+    }
+
+    private void raiseAlert(String severity,String dedupeKey,String title,String message) {
+        long now=Instant.now().getEpochSecond(); long cooldown=Math.max(30,config.alertCooldownSeconds());
+        synchronized(alertCooldowns) {
+            Long previous=alertCooldowns.get(dedupeKey);
+            if(previous!=null && now-previous<cooldown)return;
+            alertCooldowns.put(dedupeKey,now);
+        }
+        try { db.createAlert(severity,dedupeKey,title,message); }
+        catch(Exception e){logger.warn("Could not persist monitoring alert {}",dedupeKey,e);}
+        sendDiscordAlert(title,message);
+    }
+
+    private Map<String,Object> monitoringView() throws Exception {
+        List<Map<String,Object>> backends=serversView();
+        long online=backends.stream().filter(row->"ONLINE".equals(row.get("health"))).count();
+        long offline=backends.stream().filter(row->"OFFLINE".equals(row.get("health"))).count();
+        List<Map<String,Object>> currentAlerts=db.alerts(100,"OPEN");
+        Map<String,Object> out=new LinkedHashMap<>();
+        out.put("checkedAt",Instant.now().getEpochSecond());out.put("backendCount",backends.size());
+        out.put("onlineBackends",online);out.put("offlineBackends",offline);out.put("backends",backends);
+        out.put("alerts",currentAlerts);out.put("alertCounts",db.alertCounts());out.put("highLatencyMs",config.highLatencyMs());
+        out.put("alertCooldownSeconds",config.alertCooldownSeconds());out.put("jvmUsedBytes",Runtime.getRuntime().totalMemory()-Runtime.getRuntime().freeMemory());
+        out.put("jvmMaxBytes",Runtime.getRuntime().maxMemory());out.put("httpErrors",httpErrors.get());
+        return out;
+    }
+
+    private Map<String,Object> diagnosticsView() throws Exception {
+        Map<String,Object> d=new LinkedHashMap<>();
+        d.put("pluginVersion","4.3.0");d.put("javaVersion",System.getProperty("java.version"));
+        d.put("javaVendor",System.getProperty("java.vendor"));d.put("os",System.getProperty("os.name")+" "+System.getProperty("os.version"));
+        d.put("processors",Runtime.getRuntime().availableProcessors());d.put("jvmUsedBytes",Runtime.getRuntime().totalMemory()-Runtime.getRuntime().freeMemory());
+        d.put("jvmMaxBytes",Runtime.getRuntime().maxMemory());d.put("uptimeSeconds",Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond()));
+        d.put("databaseHealthy",db.healthCheck());d.put("databaseType","SQLite");d.put("httpListeners",webServers.keySet().stream().map(v->v?"HTTPS":"HTTP").sorted().toList());
+        d.put("backendHealth",serversView().stream().map(row->{Map<String,Object> safe=new LinkedHashMap<>();safe.put("name",row.get("name"));safe.put("health",row.get("health"));safe.put("playerCount",row.get("playerCount"));safe.put("latencyMs",row.get("latencyMs"));return safe;}).toList());d.put("requestErrors",httpErrors.get());
+        d.put("warning","Diagnostics omit credentials, webhook URLs, private keys, filesystem paths and API secrets.");
+        return d;
+    }
+
+    private Map<String,Object> diagnosticsBundle() throws Exception {
+        Map<String,Object> bundle = new LinkedHashMap<>();
+        bundle.put("format", "vertex-diagnostics-v1");
+        bundle.put("generatedAt", Instant.now().getEpochSecond());
+        bundle.put("diagnostics", diagnosticsView());
+        bundle.put("monitoringPolicy", Map.of("highLatencyMs", config.highLatencyMs(),
+                "alertCooldownSeconds", config.alertCooldownSeconds(), "alertHistoryLimit", config.alertHistoryLimit()));
+        bundle.put("openAlerts", db.alerts(100, "OPEN").stream().map(a -> {
+            Map<String,Object> safe = new LinkedHashMap<>();
+            safe.put("severity", a.get("severity")); safe.put("source", a.get("source"));
+            safe.put("title", a.get("title")); safe.put("status", a.get("status")); safe.put("createdAt", a.get("createdAt"));
+            return safe;
+        }).toList());
+        bundle.put("recentActivityTypes", db.events(100).stream().map(e -> Map.of(
+                "type", String.valueOf(e.get("type")), "timestamp", e.get("timestamp") == null ? 0L : e.get("timestamp"))).toList());
+        bundle.put("recentAdminActionTypes", db.auditLogs(100).stream().map(a -> Map.of(
+                "action", String.valueOf(a.get("action")), "timestamp", a.get("timestamp") == null ? 0L : a.get("timestamp"))).toList());
+        bundle.put("note", "Sanitized support bundle. It excludes player names/UUIDs, client IPs, audit targets/details, passwords, API keys, cookies, webhook URLs, TLS private keys, backend addresses and filesystem paths.");
+        return bundle;
+    }
+
+    private Map<String,Object> globalSearch(String raw) throws Exception {
+        String query=raw==null?"":raw.trim();
+        if(query.length()<2 || query.length()>64)return Map.of("query",query,"players",List.of(),"servers",List.of(),"events",List.of());
+        String normalized=query.toLowerCase(Locale.ROOT);
+        List<Map<String,Object>> live=new ArrayList<>();
+        for(Player player:proxy.getAllPlayers()){
+            String backend=player.getCurrentServer().map(v->v.getServerInfo().getName()).orElse("Connecting");
+            if(player.getUsername().toLowerCase(Locale.ROOT).contains(normalized)||player.getUniqueId().toString().toLowerCase(Locale.ROOT).contains(normalized)){
+                Map<String,Object> row=new LinkedHashMap<>();row.put("username",player.getUsername());row.put("uuid",player.getUniqueId().toString());row.put("server",backend);row.put("ping",player.getPing());live.add(row);
+            }
+        }
+        List<Map<String,Object>> matchedServers=serversView().stream().filter(v->String.valueOf(v.get("name")).toLowerCase(Locale.ROOT).contains(normalized)||String.valueOf(v.get("address")).toLowerCase(Locale.ROOT).contains(normalized)).limit(8).toList();
+        List<Map<String,Object>> knownPlayers=db.playerDirectory(query,10);
+        List<Map<String,Object>> matchedEvents=db.events(300).stream().filter(v->String.valueOf(v.get("username")).toLowerCase(Locale.ROOT).contains(normalized)||String.valueOf(v.get("uuid")).toLowerCase(Locale.ROOT).contains(normalized)||String.valueOf(v.get("server")).toLowerCase(Locale.ROOT).contains(normalized)).limit(10).toList();
+        return Map.of("query",query,"players",live,"knownPlayers",knownPlayers,"servers",matchedServers,"events",matchedEvents);
+    }
+
+    private void executeSafeCommand(HttpExchange x,Session session) throws Exception {
+        requireWriteAdmin(x,session);Map<?,?> request=body(x);String action=string(request,"action","").trim();
+        Map<String,Object> result=new LinkedHashMap<>();result.put("ok",true);result.put("action",action);
+        switch(action){
+            case "probe_backends" -> {probeBackends();result.put("message","Backend probes submitted.");}
+            case "reload_aliases" -> {int count=aliases.reload();result.put("registeredAliases",count);result.put("message","Command aliases reloaded.");}
+            case "database_check" -> {boolean healthy=db.healthCheck();result.put("healthy",healthy);result.put("message",healthy?"SQLite integrity check passed.":"SQLite integrity check failed.");if(!healthy)result.put("ok",false);}
+            default -> {json(x,400,Map.of("error","Unsupported action. Only probe_backends, reload_aliases and database_check are allowed."));return;}
+        }
+        db.audit(session.username,"COMMAND_CENTER_"+action.toUpperCase(Locale.ROOT),null,clientIp(x),String.valueOf(result.get("message")));
+        json(x,200,result);
+    }
+
+    private String csvCell(Object raw) {
+        String value=raw==null?"":String.valueOf(raw);
+        int first=0;while(first<value.length()&&Character.isWhitespace(value.charAt(first)))first++;
+        if(first<value.length() && "=+-@".indexOf(value.charAt(first))>=0)value="'"+value;
+        return "\""+value.replace("\"","\"\"")+"\"";
+    }
+    private String csv(List<String> header,List<? extends List<?>> rows) {
+        StringBuilder out=new StringBuilder("\uFEFF");
+        out.append(header.stream().map(this::csvCell).collect(java.util.stream.Collectors.joining(","))).append("\r\n");
+        for(List<?> row:rows)out.append(row.stream().map(this::csvCell).collect(java.util.stream.Collectors.joining(","))).append("\r\n");
+        return out.toString();
+    }
+    private void jsonDownload(HttpExchange x, String filename, Object data) throws IOException {
+        byte[] bytes = gson.toJson(data).getBytes(StandardCharsets.UTF_8);
+        x.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+        x.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"" + filename + "\"");
+        x.sendResponseHeaders(200, bytes.length);
+        try (OutputStream out = x.getResponseBody()) { out.write(bytes); }
+    }
+
+    private void csv(HttpExchange x,String filename,String content) throws IOException {
+        byte[] data=content.getBytes(StandardCharsets.UTF_8);x.getResponseHeaders().set("Content-Type","text/csv; charset=utf-8");
+        x.getResponseHeaders().set("Content-Disposition","attachment; filename=\""+filename+"\"");x.getResponseHeaders().set("Cache-Control","no-store");
+        x.sendResponseHeaders(200,data.length);try(OutputStream out=x.getResponseBody()){out.write(data);}
+    }
+    private String metricsCsv() throws Exception {
+        List<List<?>> rows=new ArrayList<>();for(Map<String,Object> m:db.metrics(querySafeExportLimit(5000)))rows.add(List.of(m.get("timestamp"),m.get("players"),m.get("backends"),m.get("uptimeSeconds")));
+        return csv(List.of("timestamp","online_players","backend_count","uptime_seconds"),rows);
+    }
+    private String eventsCsv() throws Exception {
+        List<List<?>> rows=new ArrayList<>();for(Map<String,Object> e:db.events(querySafeExportLimit(5000)))rows.add(Arrays.asList(e.get("timestamp"),e.get("type"),e.get("username"),e.get("uuid"),e.get("server"),e.get("details")));
+        return csv(List.of("timestamp","type","username","uuid","server","details"),rows);
+    }
+    private String playersCsv() throws Exception {
+        List<List<?>> rows=new ArrayList<>();for(Map<String,Object> p:db.playerDirectoryExport(5000))rows.add(Arrays.asList(p.get("username"),p.get("uuid"),p.get("loginCount"),p.get("lastSeen"),p.get("firstSeen")));
+        return csv(List.of("username","uuid","login_count","last_seen","first_seen"),rows);
+    }
+    private String backendsCsv() throws Exception {
+        List<List<?>> rows=new ArrayList<>();for(Map<String,Object> b:db.backendMetrics(5000))rows.add(Arrays.asList(b.get("server"),b.get("status"),b.get("latencyMs"),b.get("timestamp")));
+        return csv(List.of("server","status","latency_ms","timestamp"),rows);
+    }
+    private String auditCsv() throws Exception {
+        List<List<?>> rows=new ArrayList<>();for(Map<String,Object> e:db.auditLogs(5000))rows.add(Arrays.asList(e.get("timestamp"),e.get("actor"),e.get("action"),e.get("target"),e.get("ip"),e.get("details")));
+        return csv(List.of("timestamp","actor","action","target","ip","details"),rows);
+    }
+    private int querySafeExportLimit(int fallback){return fallback;}
+
+    private List<Map<String,Object>> databaseBackups() throws IOException {
+        Path directory=dataDirectory.resolve("database-backups");if(!Files.isDirectory(directory))return List.of();
+        try(var files=Files.list(directory)){
+            return files.filter(Files::isRegularFile).filter(f->f.getFileName().toString().matches("vertex-panel-\\d{8}-\\d{6}-\\d{3}\\.sqlite"))
+                    .sorted(Comparator.comparingLong((Path f)->f.toFile().lastModified()).reversed()).limit(30)
+                    .map(f->{Map<String,Object> row=new LinkedHashMap<>();try{row.put("name",f.getFileName().toString());row.put("sizeBytes",Files.size(f));row.put("createdAt",f.toFile().lastModified()/1000);}catch(IOException ignored){}return row;}).toList();
+        }
+    }
+    private void createDatabaseBackup(HttpExchange x,Session session) throws Exception {
+        String stamp=java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS").withZone(java.time.ZoneOffset.UTC).format(Instant.now());
+        Path target=dataDirectory.resolve("database-backups").resolve("vertex-panel-"+stamp+".sqlite");
+        Path backupDirectory=target.getParent();Files.createDirectories(backupDirectory);
+        try { Files.setPosixFilePermissions(backupDirectory,Set.of(java.nio.file.attribute.PosixFilePermission.OWNER_READ,java.nio.file.attribute.PosixFilePermission.OWNER_WRITE,java.nio.file.attribute.PosixFilePermission.OWNER_EXECUTE)); } catch(IOException | UnsupportedOperationException permissionFailure){logger.warn("Could not restrict database backup directory permissions; verify the host ACLs",permissionFailure);}
+        Path saved=db.backupTo(target);
+        try { Files.setPosixFilePermissions(saved,Set.of(java.nio.file.attribute.PosixFilePermission.OWNER_READ,java.nio.file.attribute.PosixFilePermission.OWNER_WRITE)); } catch(IOException | UnsupportedOperationException permissionFailure){logger.warn("Could not restrict database backup file permissions; verify the host ACLs",permissionFailure);}
+        pruneDatabaseBackups();db.audit(session.username,"DATABASE_BACKUP_CREATED",saved.getFileName().toString(),clientIp(x),"sizeBytes="+Files.size(saved));
+        json(x,201,Map.of("ok",true,"name",saved.getFileName().toString(),"sizeBytes",Files.size(saved),"message","Consistent SQLite snapshot created. Download it and store it outside the proxy host."));
+    }
+    private void pruneDatabaseBackups() throws IOException {
+        Path directory=dataDirectory.resolve("database-backups");if(!Files.isDirectory(directory))return;
+        try(var files=Files.list(directory)){
+            List<Path> backups=files.filter(Files::isRegularFile).filter(f->f.getFileName().toString().matches("vertex-panel-\\d{8}-\\d{6}-\\d{3}\\.sqlite"))
+                    .sorted(Comparator.comparingLong((Path f)->f.toFile().lastModified()).reversed()).toList();
+            for(Path obsolete:backups.stream().skip(30).toList())Files.deleteIfExists(obsolete);
+        }
+    }
+
+    private void downloadDatabaseBackup(HttpExchange x,String path) throws IOException {
+        String name=path.substring("/api/v1/backups/database/".length());
+        if(!name.matches("vertex-panel-\\d{8}-\\d{6}-\\d{3}\\.sqlite")){json(x,400,Map.of("error","Invalid backup filename"));return;}
+        Path directory=dataDirectory.resolve("database-backups").toAbsolutePath().normalize();Path file=directory.resolve(name).normalize();
+        if(!file.getParent().equals(directory)||!Files.isRegularFile(file)){json(x,404,Map.of("error","Backup not found"));return;}
+        long size=Files.size(file);if(size>512L*1024*1024){json(x,413,Map.of("error","Backup is too large for a direct download"));return;}
+        x.getResponseHeaders().set("Content-Type","application/vnd.sqlite3");x.getResponseHeaders().set("Content-Disposition","attachment; filename=\""+name+"\"");
+        x.sendResponseHeaders(200,size);try(InputStream in=Files.newInputStream(file);OutputStream out=x.getResponseBody()){in.transferTo(out);}
+    }
+
     private Map<String,Object> stats() throws Exception {
         Map<String,Object> m=new LinkedHashMap<>();m.put("onlinePlayers",proxy.getPlayerCount());m.put("backendCount",proxy.getAllServers().size());m.put("uptimeSeconds",Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond()));m.put("startedAt",startedAt.getEpochSecond());m.put("jvmUsedBytes",Runtime.getRuntime().totalMemory()-Runtime.getRuntime().freeMemory());m.put("jvmTotalBytes",Runtime.getRuntime().totalMemory());m.put("jvmMaxBytes",Runtime.getRuntime().maxMemory());m.put("processors",Runtime.getRuntime().availableProcessors());m.put("httpErrors",httpErrors.get());m.put("maintenance",maintenance.enabled());m.put("latestEvents",db.events(8));return m;
     }
@@ -735,6 +968,7 @@ public final class WebPanelServer {
     private void serverDetails(HttpExchange x,String name)throws Exception{RegisteredServer server=proxy.getServer(name).orElse(null);if(server==null){json(x,404,Map.of("error","Unknown backend","server",name));return;}Map<String,Object> result=new LinkedHashMap<>();result.put("name",server.getServerInfo().getName());result.put("address",server.getServerInfo().getAddress().getHostString());result.put("port",server.getServerInfo().getAddress().getPort());List<Map<String,Object>> connected=new ArrayList<>();for(Player p:server.getPlayersConnected()){Map<String,Object> player=new LinkedHashMap<>();player.put("username",p.getUsername());player.put("uuid",p.getUniqueId().toString());player.put("ping",p.getPing());connected.add(player);}result.put("playerCount",connected.size());result.put("players",connected);BackendHealth health=backendHealth.get(server.getServerInfo().getName());result.put("health",health==null?"CHECKING":health.status);if(health!=null){result.put("latencyMs",health.latencyMs);result.put("lastCheck",health.checkedAt);}json(x,200,result);}
     private List<Map<String,Object>> serversView(){List<Map<String,Object>> out=new ArrayList<>();for(RegisteredServer s:proxy.getAllServers()){Map<String,Object> m=new LinkedHashMap<>();m.put("name",s.getServerInfo().getName());m.put("address",s.getServerInfo().getAddress().getHostString());m.put("port",s.getServerInfo().getAddress().getPort());m.put("connectedPlayers",s.getPlayersConnected().stream().map(Player::getUsername).toList());m.put("playerCount",s.getPlayersConnected().size());BackendHealth health=backendHealth.get(s.getServerInfo().getName());m.put("health",health==null?"CHECKING":health.status);m.put("latencyMs",health==null?null:health.latencyMs);m.put("lastCheck",health==null?null:health.checkedAt);out.add(m);}out.sort(Comparator.comparing(m->String.valueOf(m.get("name"))));return out;}
     private void playerAction(HttpExchange x,Session session,String path) throws Exception {
+        if(session.apiKey){json(x,403,Map.of("error","Player moderation requires an interactive panel account, not an API key."));return;}
         String rest=path.substring("/api/v1/players/".length());String[] parts=rest.split("/");if(parts.length!=2){json(x,404,Map.of("error","Unknown player action"));return;}UUID uuid;try{uuid=UUID.fromString(parts[0]);}catch(IllegalArgumentException e){json(x,400,Map.of("error","Invalid UUID"));return;}Player player=proxy.getPlayer(uuid).orElse(null);if(player==null){json(x,404,Map.of("error","Player is not connected"));return;}
         Map<?,?> body=body(x);if(parts[1].equals("disconnect")){requireRole(x,session,"OWNER","ADMINISTRATOR","MODERATOR");String reason=string(body,"reason","Disconnected by a network administrator");if(reason.length()>200)reason=reason.substring(0,200);player.disconnect(Component.text(reason));db.recordPlayerEvent("ADMIN_DISCONNECT",player.getUniqueId().toString(),player.getUsername(),player.getCurrentServer().map(s->s.getServerInfo().getName()).orElse(null),"Disconnected by "+session.username+": "+reason,Instant.now());db.audit(session.username,"PLAYER_DISCONNECT",player.getUsername(),clientIp(x),reason);json(x,200,Map.of("ok",true));return;}
         if(parts[1].equals("transfer")){requireRole(x,session,"OWNER","ADMINISTRATOR","MODERATOR");String target=string(body,"server","");RegisteredServer destination=proxy.getServer(target).orElse(null);if(destination==null){json(x,400,Map.of("error","Unknown destination server"));return;}String from=player.getCurrentServer().map(s->s.getServerInfo().getName()).orElse("unknown");player.createConnectionRequest(destination).connect().whenComplete((result,error)->{if(error!=null){logger.warn("Transfer failed for {}",player.getUsername(),error);db.recordPlayerEvent("TRANSFER_ERROR",player.getUniqueId().toString(),player.getUsername(),target,error.getClass().getSimpleName(),Instant.now());}});db.recordPlayerEvent("TRANSFER_REQUEST",player.getUniqueId().toString(),player.getUsername(),target,from+" -> "+target+" (requested by "+session.username+")",Instant.now());db.audit(session.username,"PLAYER_TRANSFER",player.getUsername(),clientIp(x),from+" -> "+target);json(x,202,Map.of("ok",true,"message","Transfer request submitted","server",target));return;}
@@ -774,21 +1008,37 @@ public final class WebPanelServer {
             String details=(previous==null?"Initial connectivity state: "+status:"Connectivity changed from "+previous.status+" to "+status)+(latency>=0?"; latency="+latency+"ms":"");
             db.recordPlayerEvent("BACKEND_"+status,null,null,name,details,Instant.ofEpochSecond(now));
             logger.info("Backend {} connectivity: {}{}",name,status,latency>=0?" ("+latency+" ms)":"");
-            sendDiscordAlert("Backend "+name+" "+status,details);
-        } else if(latency>=1000 && (previous.latencyMs<1000 || previous.latencyMs<0)) { sendDiscordAlert("High backend latency: "+name, "Measured ping is "+latency+" ms."); }
+            if ("OFFLINE".equals(status)) raiseAlert("CRITICAL","backend:"+name+":offline","Backend offline: "+name,details);
+            else if (previous != null && "OFFLINE".equals(previous.status)) raiseAlert("INFO","backend:"+name+":restored","Backend restored: "+name,details);
+        }
+        int threshold=config.highLatencyMs();
+        if("ONLINE".equals(status) && latency>=threshold && (previous==null || previous.latencyMs<threshold)) {
+            raiseAlert("WARNING","backend:"+name+":latency","High backend latency: "+name,"Measured ping is "+latency+" ms (threshold: "+threshold+" ms).");
+        }
     }
 
     public void notifyProxyStarted() { sendDiscordAlert("Velocity proxy started", "Vertex Velocity Web Panel is online. Backend monitoring is active."); }
     private void sendDiscordAlert(String title,String description) {
         if(!config.discordEnabled() || config.discordWebhook().isBlank()) return;
         String url=config.discordWebhook().trim(); if(!url.startsWith("https://discord.com/api/webhooks/") && !url.startsWith("https://discordapp.com/api/webhooks/")) { logger.warn("Discord webhook ignored: only official HTTPS Discord webhook URLs are accepted"); return; }
-        CompletableFuture.runAsync(() -> {
+        try { alertExecutor.execute(() -> {
+            HttpURLConnection connection = null;
             try {
-                Map<String,Object> embed=new LinkedHashMap<>();embed.put("title",title);embed.put("description",description);embed.put("color",0x8B5CF6);embed.put("timestamp",Instant.now().toString());
+                Map<String,Object> embed=new LinkedHashMap<>();
+                embed.put("title",title.length()>256?title.substring(0,256):title);
+                embed.put("description",description.length()>1500?description.substring(0,1500):description);
+                embed.put("color",0x2474E8);embed.put("timestamp",Instant.now().toString());
                 String payload=gson.toJson(Map.of("username","Vertex Velocity","embeds",List.of(embed)));
-                HttpURLConnection c=(HttpURLConnection)URI.create(url).toURL().openConnection();c.setRequestMethod("POST");c.setConnectTimeout(3000);c.setReadTimeout(3000);c.setDoOutput(true);c.setRequestProperty("Content-Type","application/json; charset=utf-8");byte[] bytes=payload.getBytes(StandardCharsets.UTF_8);c.setFixedLengthStreamingMode(bytes.length);try(OutputStream out=c.getOutputStream()){out.write(bytes);}int code=c.getResponseCode();if(code<200||code>=300)logger.warn("Discord webhook returned HTTP {}",code);c.disconnect();
+                connection=(HttpURLConnection)URI.create(url).toURL().openConnection();
+                connection.setInstanceFollowRedirects(false); connection.setRequestMethod("POST");
+                connection.setConnectTimeout(3000);connection.setReadTimeout(3000);connection.setDoOutput(true);
+                connection.setRequestProperty("Content-Type","application/json; charset=utf-8");
+                byte[] bytes=payload.getBytes(StandardCharsets.UTF_8);connection.setFixedLengthStreamingMode(bytes.length);
+                try(OutputStream out=connection.getOutputStream()){out.write(bytes);}
+                int code=connection.getResponseCode();if(code<200||code>=300)logger.warn("Discord webhook returned HTTP {}",code);
             } catch(Exception e) { logger.warn("Could not deliver Discord alert: {}",e.getMessage()); }
-        });
+            finally { if(connection!=null) connection.disconnect(); }
+        }); } catch (RejectedExecutionException stopped) { logger.debug("Skipping Discord delivery because the panel is stopping."); }
     }
 
     private void updateConfig(HttpExchange x,Session session) throws Exception {
@@ -835,6 +1085,14 @@ public final class WebPanelServer {
         }
     }
 
+    private boolean apiKeyWriteAllowed(String path, String method) {
+        if (!"POST".equals(method)) return false;
+        return path.equals("/api/v1/monitoring/probe")
+                || path.equals("/api/v1/command-center")
+                || path.equals("/api/v1/alerts/ack-all")
+                || path.matches("/api/v1/alerts/[0-9]+/ack");
+    }
+
     private void requireOwner(HttpExchange x,Session s) throws ForbiddenException {if(!s.role.equals("OWNER"))throw new ForbiddenException();}
     private void requireWriteAdmin(HttpExchange x,Session s) throws ForbiddenException {
         if (s.apiKey) { if (!s.apiWrite) throw new ForbiddenException(); return; }
@@ -868,7 +1126,7 @@ public final class WebPanelServer {
         result.put("acmeLastCheck", lastAcmeCheck); result.put("acmeLastError", lastAcmeError); result.put("certificateFingerprint", lastCertificateFingerprint.isBlank()?null:lastCertificateFingerprint);
         result.put("reverseProxyMode", config.reverseProxyMode());
         result.put("tlsTermination", config.reverseProxyMode()?"TRUSTED_REVERSE_PROXY":"PANEL_LISTENER");
-        if (config.acmeEnabled()) { result.put("acmeDomain", config.acmeDomain()); result.put("acmeCertificatePath", acme == null ? null : acme.certificatePath().toString()); }
+        if (config.acmeEnabled()) result.put("acmeDomain", config.acmeDomain());
         if (tlsMaterial != null) result.put("certificate", tlsMaterial.view());
         return result;
     }
@@ -880,9 +1138,27 @@ public final class WebPanelServer {
     private String cookie(HttpExchange x,String name){String c=x.getRequestHeaders().getFirst("Cookie");if(c==null)return null;for(String pair:c.split(";")){String[] p=pair.trim().split("=",2);if(p.length==2&&p[0].equals(name))return p[1];}return null;}
     private String clientIp(HttpExchange x){InetSocketAddress a=x.getRemoteAddress();return a==null?"unknown":a.getAddress().getHostAddress();}
     private String randomToken(){byte[] b=new byte[32];new java.security.SecureRandom().nextBytes(b);return Base64.getUrlEncoder().withoutPadding().encodeToString(b);}
-    private void addSecurityHeaders(HttpExchange x){Headers h=x.getResponseHeaders();h.set("X-Content-Type-Options","nosniff");h.set("X-Frame-Options","DENY");h.set("Referrer-Policy","no-referrer");h.set("Content-Security-Policy","default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'");h.set("Cache-Control","no-store");}
-    private void serveResource(HttpExchange x,String resource,String type)throws IOException{try(InputStream in=getClass().getResourceAsStream(resource)){if(in==null){json(x,404,Map.of("error","Resource not found"));return;}byte[] b=in.readAllBytes();x.getResponseHeaders().set("Content-Type",type);x.sendResponseHeaders(200,b.length);x.getResponseBody().write(b);}}
-    private void json(HttpExchange x,int status,Object data)throws IOException{byte[] b=gson.toJson(data).getBytes(StandardCharsets.UTF_8);x.getResponseHeaders().set("Content-Type","application/json; charset=utf-8");x.sendResponseHeaders(status,b.length);x.getResponseBody().write(b);}
+    private void addSecurityHeaders(HttpExchange x){
+        Headers h=x.getResponseHeaders();
+        h.set("X-Content-Type-Options","nosniff"); h.set("X-Frame-Options","DENY");
+        h.set("Referrer-Policy","no-referrer"); h.set("Permissions-Policy","camera=(), microphone=(), geolocation=()");
+        h.set("Cross-Origin-Opener-Policy","same-origin"); h.set("Cross-Origin-Resource-Policy","same-origin");
+        h.set("Content-Security-Policy","default-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'");
+        h.set("Cache-Control","no-store");
+        if (x instanceof HttpsExchange) h.set("Strict-Transport-Security","max-age=31536000; includeSubDomains");
+    }
+    private void serveResource(HttpExchange x,String resource,String type)throws IOException{
+        try(InputStream in=getClass().getResourceAsStream(resource)){
+            if(in==null){json(x,404,Map.of("error","Resource not found"));return;}
+            byte[] b=in.readAllBytes();x.getResponseHeaders().set("Content-Type",type);
+            x.sendResponseHeaders(200,b.length);try(OutputStream out=x.getResponseBody()){out.write(b);}
+        }
+    }
+    private void json(HttpExchange x,int status,Object data)throws IOException{
+        byte[] b=gson.toJson(data).getBytes(StandardCharsets.UTF_8);
+        x.getResponseHeaders().set("Content-Type","application/json; charset=utf-8");
+        x.sendResponseHeaders(status,b.length);try(OutputStream out=x.getResponseBody()){out.write(b);}
+    }
     private void safeJson(HttpExchange x,int status,Object data){try{json(x,status,data);}catch(Exception ignored){}}
     private void stopListeners() {
         for (HttpServer server : webServers.values()) {
@@ -894,6 +1170,7 @@ public final class WebPanelServer {
     public void stop() {
         stopListeners();
         webExecutor.shutdownNow();
+        alertExecutor.shutdownNow();
         sessions.clear();
         pendingLogins.clear();
         loginAttempts.clear();
@@ -901,7 +1178,7 @@ public final class WebPanelServer {
     }
     private record Session(String username,String role,long expiresAt,boolean apiKey,boolean apiWrite){}
     private record FailureState(int failures,long blockedUntil,long lastFailure){}
-    private record PendingLogin(String username,String role,long expiresAt){}
+    private record PendingLogin(String username,String role,long expiresAt,String ip){}
     private record BackendHealth(String status,long latencyMs,long checkedAt){}
     private static final class ForbiddenException extends Exception{}
 }

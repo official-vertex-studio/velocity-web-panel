@@ -10,7 +10,7 @@ Base path: `/api/v1`. JSON is used for request and response bodies. Limits are c
 - `POST /login/2fa` completes the challenge with a six-digit TOTP code.
 - `POST /logout` invalidates the current session.
 - Browser/session-authenticated endpoints use the cookie. External applications should use an owner-created API key in `Authorization: Bearer vv_live_...`.
-- API keys have `READ` or `READ_WRITE` scope. Read keys may use GET endpoints; write keys may call the supported MOTD/maintenance update and alias-reload endpoints. A write key is not an owner credential and cannot administer users or API keys. Never place keys in client-side browser code.
+- API keys have `READ` or `READ_WRITE` scope. `READ` keys can only use read methods permitted to viewers. `READ_WRITE` keys do not inherit the Administrator role: they are limited to backend probes, alert acknowledgement and three predefined safe Command Center actions. Configuration edits, player moderation and account administration require an interactive browser session. Never place keys in client-side browser code.
 
 ## API key management (OWNER only)
 
@@ -73,7 +73,7 @@ Revokes a key. The next request using it will fail authentication. A key cannot 
 | GET | `/2fa` | Current account TOTP status (session) |
 | GET/POST | `/routing` | Read/write the fallback order in native `velocity.toml` (OWNER writes; ADMINISTRATOR may read) |
 
-## Mutating endpoints (session required, except documented `READ_WRITE` API-key routes)
+## Mutating endpoints (interactive browser session required, except the limited `READ_WRITE` routes listed below)
 
 | Method | Route | Access |
 |---|---|---|
@@ -93,11 +93,11 @@ Revokes a key. The next request using it will fail authentication. A key cannot 
 | POST | `/velocity-config/backups/restore` | OWNER; restore a timestamped Velocity config snapshot; proxy restart required |
 | GET/POST | `/users` | OWNER |
 | POST | `/users/{username}` | OWNER; disable/enable account |
-| PUT | `/maintenance` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key |
-| PUT | `/motd` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key |
-| POST | `/maintenance/whitelist` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key; JSON `uuid` or online `playerName` |
-| POST/DELETE | `/maintenance/whitelist/{uuid}` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key |
-| POST | `/aliases/reload` | OWNER/ADMINISTRATOR session or `READ_WRITE` API key |
+| PUT | `/maintenance` | OWNER/ADMINISTRATOR interactive session |
+| PUT | `/motd` | OWNER/ADMINISTRATOR interactive session |
+| POST | `/maintenance/whitelist` | OWNER/ADMINISTRATOR interactive session; JSON `uuid` or online `playerName` |
+| POST/DELETE | `/maintenance/whitelist/{uuid}` | OWNER/ADMINISTRATOR interactive session |
+| POST | `/aliases/reload` | OWNER/ADMINISTRATOR interactive session; API keys may invoke this through the safe Command Center allowlist only |
 
 ## TOTP and routing
 
@@ -114,16 +114,18 @@ curl "$VERTEX_PANEL_URL/api/v1/stats" \
   -H "Authorization: Bearer $VERTEX_PANEL_API_KEY"
 ```
 
-### Update maintenance using a READ_WRITE key
+### Safe operations using a READ_WRITE key
+
+The supported write scope is intentionally narrow. For example, request a backend health probe:
 
 ```bash
-curl -X PUT "$VERTEX_PANEL_URL/api/v1/maintenance" \
+curl -X POST "$VERTEX_PANEL_URL/api/v1/monitoring/probe" \
   -H "Authorization: Bearer $VERTEX_PANEL_WRITE_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"enabled":true,"message":"Maintenance in progress","kickMessage":"Please try again later","whitelistEnabled":true,"allowExistingPlayers":true,"kickExistingPlayers":false}'
+  -d '{}'
 ```
 
-Use a dedicated `READ_WRITE` key for automation. Do not give it to read-only integrations; it can modify supported administrative settings.
+A `READ_WRITE` key may also acknowledge alerts or invoke only `probe_backends`, `reload_aliases`, and `database_check` through `/command-center`. It cannot edit MOTD, maintenance, aliases configuration, backend registry or routing.
 
 ### Node.js helper
 
@@ -193,7 +195,7 @@ All SDKs call the same language-neutral REST routes; there is no separate API im
 | Node.js | `examples/node/vertex-client.mjs` | health, stats, players and filters, player profile, player directory, servers/details, commands, network, activity, events, analytics, maintenance |
 | Go, Java, C#/.NET, PHP, Ruby, Rust, PowerShell, Kotlin | `examples/` language folders | authenticated HTTP/JSON examples; call additional routes by changing the `/api/v1/...` path in the request |
 
-API keys have a scope: `READ` allows GET requests only; `READ_WRITE` allows write methods on routes that grant the Administrator role. Owner-only endpoints remain owner-only and cannot be accessed with API keys. Use the least-privilege scope and revoke exposed keys immediately.
+API keys have a scope: `READ` allows safe read requests available to viewers; `READ_WRITE` allows only the explicit safe-operation allowlist documented above. Neither API-key scope provides owner or administrator identity. Owner-only and administrator-only endpoints remain browser-session-only. Use the least-privilege scope and revoke exposed keys immediately.
 
 
 ### MOTD, maintenance, and command aliases
@@ -209,3 +211,40 @@ API keys have a scope: `READ` allows GET requests only; `READ_WRITE` allows writ
 - `POST /api/v1/aliases/reload` — owner/administrator; reload `aliases.yml`.
 
 Command aliases are executed by Velocity with the original command source, so Velocity permission checks on the target command still apply. `/valiasreload` is also available in-game/console to reload `aliases.yml`.
+
+
+## Monitoring and Operations (4.2.0+)
+
+| Method | Endpoint | Access | Purpose |
+|---|---|---|---|
+| GET | `/api/v1/monitoring` | Authenticated viewer or higher | Backend health, JVM usage and alert counts |
+| GET | `/api/v1/alerts?status=OPEN` | OWNER, ADMINISTRATOR, MODERATOR, VIEWER or READ_WRITE API key | Read persisted alerts |
+| POST | `/api/v1/alerts/{id}/ack` | OWNER/ADMINISTRATOR session or READ_WRITE API key | Acknowledge one alert |
+| POST | `/api/v1/alerts/ack-all` | OWNER/ADMINISTRATOR session or READ_WRITE API key | Acknowledge all open alerts |
+| GET/PUT | `/api/v1/monitoring/config` | OWNER/ADMINISTRATOR read; OWNER write | Read/update latency, cooldown and alert-history policy |
+| POST | `/api/v1/monitoring/probe` | OWNER/ADMINISTRATOR session or READ_WRITE API key | Request fresh backend pings |
+| GET | `/api/v1/diagnostics` | OWNER/ADMINISTRATOR interactive session | Sanitized JVM, SQLite and listener diagnostics |
+| GET | `/api/v1/diagnostics/export` | OWNER/ADMINISTRATOR interactive session | Download sanitized JSON support bundle |
+| GET | `/api/v1/search?q=...` | Authenticated | Search players, known profiles, backends and recent events |
+| GET/POST | `/api/v1/command-center` | OWNER/ADMINISTRATOR interactive session; READ_WRITE key may POST only allowlisted actions | Safe operations; no arbitrary console or shell execution |
+| GET | `/api/v1/exports/*.csv` | Authenticated, except audit export requires OWNER/ADMINISTRATOR | Export metrics, events, player directory, backend metrics and audit data |
+| POST/GET | `/api/v1/backups/database` | OWNER interactive session | Create/list consistent SQLite snapshots |
+| GET | `/api/v1/backups/database/{filename}` | OWNER interactive session | Download a SQLite snapshot |
+| GET | `/api/v1/openapi.json` | Authenticated | OpenAPI 3.1 API specification |
+
+The safe Command Center supports only `probe_backends`, `reload_aliases`, and `database_check`. It intentionally does not run arbitrary Velocity console commands, operating-system commands, or scripts. API keys cannot execute player moderation actions; those require an interactive panel account.
+
+SQLite snapshots are stored under the plugin data directory in `database-backups/`. Download and store backups off-host. To restore manually, stop Velocity first, preserve the current database, then replace `vertex-panel.sqlite` with a verified snapshot while the process is stopped. Never overwrite a live SQLite database file.
+
+
+## Version 4.3.0 — API key scope hardening and support bundle
+
+`READ` keys may call GET/HEAD/OPTIONS endpoints that are available to the Viewer role. `READ_WRITE` keys do **not** become administrator accounts: they may only call these write operations:
+
+- `POST /api/v1/monitoring/probe` — submit backend health probes.
+- `POST /api/v1/alerts/ack-all` and `POST /api/v1/alerts/{id}/ack` — acknowledge alerts.
+- `POST /api/v1/command-center` — call only `probe_backends`, `reload_aliases`, or `database_check`.
+
+Configuration changes, player moderation, backend changes, maintenance/MOTD changes, user management, session administration, API-key management, database backups, and audit access require the appropriate interactive browser account.
+
+`GET /api/v1/diagnostics/export` is available to interactive owners and administrators and downloads a sanitized JSON support bundle. It excludes credentials, cookies, API keys, webhook URLs, TLS private keys, filesystem paths and backend addresses. Review the bundle before sharing it with a third party.
