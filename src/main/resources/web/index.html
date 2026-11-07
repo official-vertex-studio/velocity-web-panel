@@ -513,6 +513,71 @@ $('#listener-reset').onclick=loadConfig;
 $('#listener-form').onsubmit=async e=>{e.preventDefault();let f=new FormData(e.currentTarget),v=Object.fromEntries(f);v.webEnabled=v.webEnabled==='true';for(let k of ['httpPort','sampleSeconds','retentionDays','loginAttemptsPerMinute','sessionMinutes'])v[k]=Number(v[k]);v.mode='HTTP';let result=$('#listener-result');result.classList.remove('hidden','error');result.textContent='Saving configuration…';try{let r=await api('/config',{method:'PUT',body:JSON.stringify(v)});await loadConfig();result.classList.remove('hidden','error');result.textContent=(r.message||'Settings saved.')+' Restart Velocity to apply protocol or port changes.'}catch(err){result.classList.remove('hidden');result.classList.add('error');result.textContent=err.message}};
 $('#maintenance-form').onsubmit=async e=>{e.preventDefault();let f=new FormData(e.currentTarget),el=$('#maintenance-result');el.classList.remove('hidden','error');try{let r=await api('/maintenance',{method:'PUT',body:JSON.stringify({enabled:f.get('enabled')==='on',message:f.get('message'),kickMessage:f.get('kickMessage'),whitelistEnabled:f.get('whitelistEnabled')==='on',allowExistingPlayers:f.get('allowExistingPlayers')==='on',kickExistingPlayers:f.get('kickExistingPlayers')==='on',whitelist:String(f.get('whitelist')||'').split(/\r?\n/).map(v=>v.trim()).filter(Boolean)})});el.textContent='Saved. Maintenance '+(r.enabled?'is enabled':'is disabled')+'; whitelist entries: '+r.whitelistSize+'.'}catch(err){el.classList.add('error');el.textContent=err.message}};$('#motd-form').onsubmit=async e=>{e.preventDefault();let el=$('#motd-result');el.classList.remove('hidden','error');try{let value=JSON.parse(e.currentTarget.elements.motdJson.value);let r=await api('/motd',{method:'PUT',body:JSON.stringify(value)});e.currentTarget.elements.motdJson.value=JSON.stringify(r.motd,null,2);el.textContent='MOTD configuration saved.'}catch(err){el.classList.add('error');el.textContent=err.message}};$('#aliases-form').onsubmit=async e=>{e.preventDefault();let el=$('#aliases-result');el.classList.remove('hidden','error');try{let value=JSON.parse(e.currentTarget.elements.aliasesJson.value);let r=await api('/aliases',{method:'PUT',body:JSON.stringify(value)});e.currentTarget.elements.aliasesJson.value=JSON.stringify(r.aliases,null,2);el.textContent='Saved and registered '+r.registered+' alias(es).'}catch(err){el.classList.add('error');el.textContent=err.message}};
 
+
+async function downloadProtected(path,filename){
+  const response=await fetch('/api/v1'+path,{credentials:'same-origin'});
+  if(!response.ok){let message='Download failed ('+response.status+')';try{const data=await response.json();message=data.error||message}catch{}if(response.status===401)showAuth(false);throw new Error(message)}
+  const blob=await response.blob(),url=URL.createObjectURL(blob),a=document.createElement('a');
+  a.href=url;a.download=filename||'vertex-download';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function normalizeSearchGroups(data){
+  const groups=[
+    ['Online players',data.players||data.onlinePlayers||data.connectedPlayers],
+    ['Known players',data.knownPlayers||data.playerProfiles||data.directory],
+    ['Backends',data.backends||data.servers],
+    ['Recent events',data.events||data.recentEvents||data.activity]
+  ];
+  return groups.filter(([,items])=>Array.isArray(items)&&items.length).map(([label,items])=>({label,items}));
+}
+async function runGlobalSearch(){
+  const input=$('#global-search-input'),root=$('#global-search-results'),q=(input?.value||'').trim();
+  if(!root)return;
+  if(q.length<2){root.innerHTML=empty('Enter at least two characters to search.');return}
+  root.innerHTML='<div class="empty">Searching…</div>';
+  try{
+    const data=await api('/search?q='+encodeURIComponent(q));
+    const groups=normalizeSearchGroups(data||{});
+    if(!groups.length){root.innerHTML=empty('No matching players, profiles, backends or events.');return}
+    root.innerHTML=groups.map(group=>`<div style="margin:14px 0"><div class="panel-head"><h2>${esc(group.label)}</h2><span class="tag">${group.items.length} RESULTS</span></div><div class="table-wrap"><table><thead><tr><th>Result</th><th>Details</th><th>Time / status</th></tr></thead><tbody>${group.items.map(item=>{
+      const name=item.username||item.name||item.playerName||item.server||item.backend||item.title||item.type||item.uuid||'Result';
+      const details=item.uuid||item.server||item.backend||item.details||item.description||item.message||item.source||'—';
+      const when=item.timestamp||item.createdAt||item.lastSeen||item.status||item.health||'';
+      return `<tr><td><strong>${esc(name)}</strong></td><td>${esc(details)}</td><td>${typeof when==='number'?fmtTime(when):esc(when||'—')}</td></tr>`;
+    }).join('')}</tbody></table></div></div>`).join('');
+  }catch(e){root.innerHTML=empty('Search failed: '+e.message)}
+}
+async function loadCommandInfo(){
+  const root=$('#command-result');if(!root)return;
+  try{
+    const data=await api('/command-center');
+    const actions=Array.isArray(data)?data:(data.actions||data.availableActions||[]);
+    if(actions.length){root.classList.remove('hidden','error');root.innerHTML='<strong>Available safe operations</strong><div class="small muted" style="margin-top:7px">'+actions.map(a=>esc(typeof a==='string'?a:(a.label||a.name||a.action||'Operation'))).join(' · ')+'</div>'}
+  }catch(e){root.classList.remove('hidden');root.classList.add('error');root.textContent='Could not load safe operations: '+e.message}
+}
+async function runSafeCommand(action){
+  const root=$('#command-result');if(!root)return;
+  if(!['probe_backends','reload_aliases','database_check'].includes(action)){root.textContent='Unsupported operation.';root.classList.remove('hidden');root.classList.add('error');return}
+  const labels={probe_backends:'Probe all backends',reload_aliases:'Reload command aliases',database_check:'Check database integrity'};
+  if(!confirm('Run safe operation: '+(labels[action]||action)+'?'))return;
+  root.classList.remove('hidden','error');root.textContent='Running '+(labels[action]||action)+'…';
+  try{const result=await api('/command-center',{method:'POST',body:JSON.stringify({action})});root.textContent=result.message||result.result||result.status||'Operation completed.';if(action==='probe_backends')await loadMonitoring()}
+  catch(e){root.classList.add('error');root.textContent=e.message}
+}
+async function loadDatabaseBackups(){
+  const root=$('#database-backups-table');if(!root)return;
+  root.innerHTML='<div class="empty">Loading database backups…</div>';
+  try{
+    const data=await api('/backups/database'),rows=Array.isArray(data)?data:(data.backups||data.files||[]);
+    root.innerHTML=rows.length?`<div class="table-wrap"><table><thead><tr><th>Backup</th><th>Size</th><th>Created</th><th>Action</th></tr></thead><tbody>${rows.map(b=>{
+      const filename=typeof b==='string'?b:(b.filename||b.name||b.file||'');
+      const size=typeof b==='object'?(b.sizeBytes??b.size??null):null;
+      const created=typeof b==='object'?(b.createdAt||b.timestamp||null):null;
+      return `<tr><td><strong>${esc(filename||'Database snapshot')}</strong></td><td>${size==null?'—':esc(typeof size==='number'?bytes(size):size)}</td><td>${created?(typeof created==='number'?fmtTime(created):esc(created)):'—'}</td><td>${filename?`<button data-download-db-backup="${esc(filename)}">Download</button>`:'—'}</td></tr>`;
+    }).join('')}</tbody></table></div>`:empty('No database backups yet. Create one to protect your panel data.');
+    root.querySelectorAll('[data-download-db-backup]').forEach(button=>button.onclick=()=>downloadProtected('/backups/database/'+encodeURIComponent(button.dataset.downloadDbBackup),button.dataset.downloadDbBackup).catch(e=>alert(e.message)));
+  }catch(e){root.innerHTML=empty('Could not load database backups: '+e.message)}
+}
+
 async function loadMonitoring(){const root=$('#monitor-backends');try{const m=await api('/monitoring');$('#monitor-online').textContent=m.onlineBackends??0;$('#monitor-offline').textContent=m.offlineBackends??0;$('#monitor-open-alerts').textContent=m.alertCounts?.open??(m.alerts||[]).length;$('#monitor-memory').textContent=bytes(m.jvmUsedBytes)+' / '+bytes(m.jvmMaxBytes);const rows=m.backends||[];root.innerHTML=rows.length?`<div class="table-wrap"><table><thead><tr><th>Backend</th><th>Status</th><th>Players</th><th>Latency</th><th>Last check</th></tr></thead><tbody>${rows.map(b=>`<tr><td><strong>${esc(b.name)}</strong></td><td>${pill(b.health||'CHECKING',b.health==='ONLINE'?'online':b.health==='OFFLINE'?'offline':'')}</td><td>${esc(b.playerCount??0)}</td><td>${b.latencyMs==null?'—':esc(b.latencyMs)+' ms'}</td><td>${fmtTime(b.lastCheck)}</td></tr>`).join('')}</tbody></table></div>`:empty('No backend servers are registered.');await loadAlerts();}catch(e){root.innerHTML=empty(e.message);console.error('Monitoring load failed',e)}}
 async function loadAlerts(){const el=$('#alerts-table');try{const rows=await api('/alerts?limit=100&status=ALL');el.innerHTML=rows.length?`<div class="table-wrap"><table><thead><tr><th>Severity</th><th>Alert</th><th>Source</th><th>Status</th><th>Created</th><th>Action</th></tr></thead><tbody>${rows.map(a=>`<tr><td>${pill(a.severity||'INFO')}</td><td>${esc(a.title||'Alert')}</td><td>${esc(a.source||'—')}</td><td>${pill(a.status||'OPEN',a.status==='OPEN'?'offline':'')}</td><td>${fmtTime(a.createdAt)}</td><td>${a.status==='OPEN'?`<button data-ack-alert="${esc(a.id)}">Acknowledge</button>`:'—'}</td></tr>`).join('')}</tbody></table></div>`:empty('No alerts recorded.');el.querySelectorAll('[data-ack-alert]').forEach(b=>b.onclick=async()=>{try{await api('/alerts/'+b.dataset.ackAlert+'/ack',{method:'POST',body:'{}'});await loadMonitoring()}catch(e){alert(e.message)}})}catch(e){el.innerHTML=empty(e.message)}}
 async function loadMonitoringConfig(){const form=$('#monitoring-config-form');if(!form)return;try{const c=await api('/monitoring/config');form.elements.highLatencyMs.value=c.highLatencyMs??1000;form.elements.alertCooldownSeconds.value=c.alertCooldownSeconds??300;form.elements.alertHistoryLimit.value=c.alertHistoryLimit??1000;}catch(e){const out=$('#monitor-config-result');out.textContent=e.message;out.classList.remove('hidden')}}
