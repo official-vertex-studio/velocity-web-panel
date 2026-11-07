@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Vertex Velocity Web Panel API",
-    "version": "4.3.0",
+    "version": "4.2.0",
     "description": "Authenticated REST API for a Velocity proxy administration panel. Use scoped bearer API keys for integrations; browser sessions use HttpOnly cookies and same-origin requests. READ_WRITE keys are limited to safe monitoring, alert acknowledgement and allowlisted command operations; they do not inherit administrator identity."
   },
   "servers": [

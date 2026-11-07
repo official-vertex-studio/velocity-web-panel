@@ -174,8 +174,18 @@ public final class PanelConfig {
         target.put(configKey, value);
     }
     public synchronized Map<String,Object> publicView() {
-        Map<String,Object> result = new LinkedHashMap<>(); Map<String,Object> web = new LinkedHashMap<>(section("web-panel")); Map<String,Object> nestedTls = new LinkedHashMap<>(child(section("web-panel"), "https")); nestedTls.remove("keystore-password"); web.put("https", nestedTls); result.put("web-panel", web);
-        Map<String,Object> tls = new LinkedHashMap<>(nestedTls); result.put("https", tls);
+        Map<String,Object> result = new LinkedHashMap<>();
+        Map<String,Object> web = new LinkedHashMap<>(section("web-panel"));
+        Map<String,Object> nestedTls = new LinkedHashMap<>(child(section("web-panel"), "https"));
+        // TLS material is discovered server-side. Never expose local filesystem paths or passwords.
+        nestedTls.remove("keystore-password");
+        nestedTls.remove("keystore");
+        nestedTls.remove("certificate");
+        nestedTls.remove("private-key");
+        web.put("https", nestedTls);
+        result.put("web-panel", web);
+        Map<String,Object> tls = new LinkedHashMap<>(nestedTls);
+        result.put("https", tls);
         result.put("statistics", new LinkedHashMap<>(section("statistics"))); result.put("security", new LinkedHashMap<>(section("security")));
         result.put("monitoring", new LinkedHashMap<>(section("monitoring")));
         result.put("discord", Map.of("enabled", discordEnabled(), "webhook-configured", !discordWebhook().isBlank())); return result;

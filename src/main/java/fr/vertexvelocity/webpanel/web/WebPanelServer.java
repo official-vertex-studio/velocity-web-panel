@@ -278,7 +278,7 @@ public final class WebPanelServer {
                 if(path.contains("..") || !path.matches("/assets/[A-Za-z0-9_./-]{1,180}")){json(x,400,Map.of("error","Invalid asset path"));return;}
                 serveResource(x,"/web"+path,"application/octet-stream");return;
             }
-            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","4.3.0","timestamp",Instant.now().getEpochSecond()));return;}
+            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","4.2.0","timestamp",Instant.now().getEpochSecond()));return;}
             if(path.equals("/api/v1/setup-status")&&method.equals("GET")){json(x,200,Map.of("needsSetup",db.userCount()==0));return;}
             if(path.equals("/api/v1/setup")&&method.equals("POST")){setup(x);return;}
             if(path.equals("/api/v1/login")&&method.equals("POST")){login(x);return;}
@@ -815,7 +815,7 @@ public final class WebPanelServer {
 
     private Map<String,Object> diagnosticsView() throws Exception {
         Map<String,Object> d=new LinkedHashMap<>();
-        d.put("pluginVersion","4.3.0");d.put("javaVersion",System.getProperty("java.version"));
+        d.put("pluginVersion","4.2.0");d.put("javaVersion",System.getProperty("java.version"));
         d.put("javaVendor",System.getProperty("java.vendor"));d.put("os",System.getProperty("os.name")+" "+System.getProperty("os.version"));
         d.put("processors",Runtime.getRuntime().availableProcessors());d.put("jvmUsedBytes",Runtime.getRuntime().totalMemory()-Runtime.getRuntime().freeMemory());
         d.put("jvmMaxBytes",Runtime.getRuntime().maxMemory());d.put("uptimeSeconds",Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond()));
