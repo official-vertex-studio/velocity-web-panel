@@ -90,7 +90,7 @@ public final class CommandAliasService {
         Set<String> names = new java.util.HashSet<>();
         for (Map.Entry<?, ?> entry : aliases.entrySet()) {
             String name = String.valueOf(entry.getKey()).trim().toLowerCase(Locale.ROOT);
-            if (!VALID_NAME.matcher(name).matches() || Set.of("valiasreload", "vstats", "vservers", "vplayers", "vserver", "vping", "vhelp").contains(name))
+            if (!VALID_NAME.matcher(name).matches() || Set.of("valiasreload", "vstats", "vservers", "vplayers", "vserver", "vping", "vhelp", "vpanel").contains(name))
                 throw new IOException("Invalid or reserved alias name '" + name + "'; existing aliases were kept");
             if (!names.add(name)) throw new IOException("Duplicate alias '" + name + "'; existing aliases were kept");
             if (!(entry.getValue() instanceof Map<?, ?> definition)) throw new IOException("Alias '" + name + "' must be a mapping; existing aliases were kept");
@@ -122,7 +122,7 @@ public final class CommandAliasService {
         Map<String, Object> normalized = new LinkedHashMap<>();
         for (Map.Entry<?, ?> e : aliases.entrySet()) {
             String name = String.valueOf(e.getKey()).trim().toLowerCase(Locale.ROOT);
-            if (!VALID_NAME.matcher(name).matches() || Set.of("valiasreload", "vstats", "vservers", "vplayers", "vserver", "vping", "vhelp").contains(name)) throw new IllegalArgumentException("Invalid or reserved alias name: " + name);
+            if (!VALID_NAME.matcher(name).matches() || Set.of("valiasreload", "vstats", "vservers", "vplayers", "vserver", "vping", "vhelp", "vpanel").contains(name)) throw new IllegalArgumentException("Invalid or reserved alias name: " + name);
             if (!(e.getValue() instanceof Map<?, ?> d)) throw new IllegalArgumentException("Alias " + name + " must be an object");
             String command = stringValue(d.get("command")); String permission = stringValue(d.get("permission"));
             boolean playerOnly = Boolean.parseBoolean(stringValue(d.get("player-only")));
@@ -172,7 +172,7 @@ public final class CommandAliasService {
                 logger.warn("Skipping alias '{}': command must be non-empty, single-line and must not start with '/'.", name);
                 continue;
             }
-            if (name.equals("valiasreload") || name.equals("vstats") || name.equals("vservers") || name.equals("vplayers") || name.equals("vserver") || name.equals("vping") || name.equals("vhelp")) {
+            if (name.equals("valiasreload") || name.equals("vstats") || name.equals("vservers") || name.equals("vplayers") || name.equals("vserver") || name.equals("vping") || name.equals("vhelp") || name.equals("vpanel")) {
                 logger.warn("Skipping alias '{}': name is reserved by Vertex Velocity Web Panel.", name);
                 continue;
             }

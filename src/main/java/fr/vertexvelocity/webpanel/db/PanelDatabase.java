@@ -27,6 +27,9 @@ public final class PanelDatabase implements AutoCloseable {
             s.execute("CREATE TABLE IF NOT EXISTS user_totp(username TEXT PRIMARY KEY, secret TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)");
             s.execute("CREATE TABLE IF NOT EXISTS user_totp_recovery(username TEXT NOT NULL, code_hash TEXT NOT NULL, used_at INTEGER, PRIMARY KEY(username,code_hash), FOREIGN KEY(username) REFERENCES user_totp(username) ON DELETE CASCADE)");
             s.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+            s.execute("CREATE TABLE IF NOT EXISTS invitations(token_hash TEXT PRIMARY KEY, role TEXT NOT NULL, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER)");
+            s.execute("CREATE TABLE IF NOT EXISTS role_permissions(role TEXT NOT NULL, permission TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(role,permission))");
+            s.execute("CREATE TABLE IF NOT EXISTS custom_roles(name TEXT PRIMARY KEY, created_at INTEGER NOT NULL, created_by TEXT NOT NULL)");
             s.execute("CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, uuid TEXT, username TEXT, server_name TEXT, details TEXT, created_at INTEGER NOT NULL)");
             s.execute("CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at)");
             s.execute("CREATE TABLE IF NOT EXISTS metrics(id INTEGER PRIMARY KEY AUTOINCREMENT, online_players INTEGER NOT NULL, backend_count INTEGER NOT NULL, uptime_seconds INTEGER NOT NULL, sampled_at INTEGER NOT NULL)");
@@ -132,6 +135,11 @@ public final class PanelDatabase implements AutoCloseable {
         return out;
     }
 
+    public synchronized Optional<Map<String,Object>> playerProfileByName(String username,int limit) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("SELECT uuid FROM events WHERE lower(username)=lower(?) AND uuid IS NOT NULL ORDER BY created_at DESC LIMIT 1")){
+            p.setString(1,username);try(ResultSet r=p.executeQuery()){if(!r.next())return Optional.empty();return Optional.of(playerProfile(r.getString(1),limit));}
+        }
+    }
     public synchronized Map<String,Object> playerProfile(String uuid,int limit) throws SQLException {
         List<Map<String,Object>> history=new ArrayList<>(); Set<String> visited=new TreeSet<>(String.CASE_INSENSITIVE_ORDER); long totalSeconds=0,completed=0,allLogins=0,allTransfers=0,allErrors=0,firstSeen=0; long lastLogin=0,lastSeen=0;String latestName="Unknown";
         try(PreparedStatement p=connection.prepareStatement("SELECT event_type,username,server_name,details,created_at FROM events WHERE uuid=? ORDER BY created_at DESC,id DESC LIMIT ?")){p.setString(1,uuid);p.setInt(2,Math.max(1,Math.min(500,limit)));try(ResultSet r=p.executeQuery()){while(r.next()){String type=r.getString(1),name=r.getString(2),server=r.getString(3),details=r.getString(4);long ts=r.getLong(5);if(name!=null&&!name.isBlank()&&"Unknown".equals(latestName))latestName=name;if(ts>lastSeen)lastSeen=ts;if(server!=null&&!server.isBlank()&&!server.equals("null")&&!server.startsWith("BACKEND_"))visited.add(server);Map<String,Object> e=new LinkedHashMap<>();e.put("type",type);e.put("username",name);e.put("server",server);e.put("details",details);e.put("timestamp",ts);history.add(e);}}}
@@ -154,6 +162,11 @@ public final class PanelDatabase implements AutoCloseable {
         String bucketExpression=safeDays<=1?"strftime('%Y-%m-%d %H:00',sampled_at,'unixepoch','localtime')":safeDays<=30?"strftime('%Y-%m-%d',sampled_at,'unixepoch','localtime')":"strftime('%Y-%m',sampled_at,'unixepoch','localtime')";
         List<Map<String,Object>> backend=new ArrayList<>();try(PreparedStatement p=connection.prepareStatement("SELECT server_name,COUNT(*) samples,AVG(CASE WHEN latency_ms>=0 THEN latency_ms END) avg_latency,MIN(CASE WHEN latency_ms>=0 THEN latency_ms END) min_latency,MAX(CASE WHEN latency_ms>=0 THEN latency_ms END) max_latency,AVG(CASE WHEN status='ONLINE' THEN 1.0 ELSE 0.0 END)*100 availability FROM backend_metrics WHERE sampled_at>=? GROUP BY server_name ORDER BY server_name")){p.setLong(1,cut);try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object> m=new LinkedHashMap<>();m.put("server",r.getString(1));m.put("samples",r.getLong(2));double avgLatency=r.getDouble(3);m.put("averageLatencyMs",r.wasNull()?null:Math.round(avgLatency*100.0)/100.0);m.put("minLatencyMs",nullableLong(r,4));m.put("maxLatencyMs",nullableLong(r,5));m.put("availabilityPercent",Math.round(r.getDouble(6)*100.0)/100.0);backend.add(m);}}}out.put("backends",backend);
         List<Map<String,Object>> hourly=new ArrayList<>();try(PreparedStatement p=connection.prepareStatement("SELECT "+bucketExpression+" bucket,MAX(online_players) players,AVG(online_players) averagePlayers FROM metrics WHERE sampled_at>=? GROUP BY bucket ORDER BY bucket")){p.setLong(1,cut);try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object> m=new LinkedHashMap<>();m.put("bucket",r.getString(1));m.put("players",r.getInt(2));m.put("averagePlayers",Math.round(r.getDouble(3)*100.0)/100.0);hourly.add(m);}}}out.put("timeline",hourly);return out;
+    }
+    public synchronized List<Map<String,Object>> topPlayers(int limit) throws SQLException {
+        List<Map<String,Object>> rows=playerDirectory("",Math.max(1,Math.min(100,limit)));
+        rows.sort((a,b)->Long.compare(((Number)b.getOrDefault("totalPlaySeconds",0L)).longValue(),((Number)a.getOrDefault("totalPlaySeconds",0L)).longValue()));
+        return rows.stream().limit(Math.max(1,Math.min(100,limit))).toList();
     }
     private long scalar(String sql,long... args) throws SQLException {try(PreparedStatement p=connection.prepareStatement(sql)){for(int i=0;i<args.length;i++)p.setLong(i+1,args[i]);try(ResultSet r=p.executeQuery()){return r.next()?r.getLong(1):0;}}}
     private Object nullableLong(ResultSet r,int col)throws SQLException{long n=r.getLong(col);return r.wasNull()?null:n;}
@@ -292,8 +305,73 @@ public final class PanelDatabase implements AutoCloseable {
     public synchronized boolean revokeApiKey(long id) throws SQLException {try(PreparedStatement p=connection.prepareStatement("UPDATE api_keys SET revoked=1 WHERE id=? AND revoked=0")){p.setLong(1,id);return p.executeUpdate()>0;}}
     public static String hashApiKey(String key) throws Exception { return sha256(key); }
     public synchronized void changePassword(String username,String salt,String hash) throws SQLException {try(PreparedStatement p=connection.prepareStatement("UPDATE users SET salt=?,password_hash=? WHERE username=?")){p.setString(1,salt);p.setString(2,hash);p.setString(3,username);p.executeUpdate();}}
-    public synchronized boolean createUser(String username,String salt,String hash,String role) throws SQLException {if(!username.matches("[A-Za-z0-9_.-]{3,32}")||!Set.of("ADMINISTRATOR","MODERATOR","VIEWER").contains(role))return false;try(PreparedStatement p=connection.prepareStatement("INSERT INTO users(username,salt,password_hash,role,created_at) VALUES(?,?,?,?,?)")){p.setString(1,username);p.setString(2,salt);p.setString(3,hash);p.setString(4,role);p.setLong(5,Instant.now().getEpochSecond());p.executeUpdate();return true;}catch(SQLException e){return false;}}
+    public synchronized boolean createUser(String username,String salt,String hash,String role) throws SQLException {if(!username.matches("[A-Za-z0-9_.-]{3,32}")||!(Set.of("ADMINISTRATOR","MODERATOR","VIEWER").contains(role)||customRoleExists(role)))return false;try(PreparedStatement p=connection.prepareStatement("INSERT INTO users(username,salt,password_hash,role,created_at) VALUES(?,?,?,?,?)")){p.setString(1,username);p.setString(2,salt);p.setString(3,hash);p.setString(4,role);p.setLong(5,Instant.now().getEpochSecond());p.executeUpdate();return true;}catch(SQLException e){return false;}}
     public synchronized boolean disableUser(String username,boolean disabled) throws SQLException {if("owner".equalsIgnoreCase(username))return false;try(PreparedStatement p=connection.prepareStatement("UPDATE users SET disabled=? WHERE username=? AND role!='OWNER'")){p.setInt(1,disabled?1:0);p.setString(2,username);return p.executeUpdate()>0;}}
+
+    public synchronized String createInvitation(String tokenHash,String role,String creator,long expiresAt) throws SQLException {
+        if(!(Set.of("ADMINISTRATOR","MODERATOR","VIEWER").contains(role)||customRoleExists(role))) throw new SQLException("Invalid invitation role");
+        try(PreparedStatement p=connection.prepareStatement("INSERT INTO invitations(token_hash,role,created_by,created_at,expires_at) VALUES(?,?,?,?,?)")){
+            p.setString(1,tokenHash);p.setString(2,role);p.setString(3,creator);p.setLong(4,Instant.now().getEpochSecond());p.setLong(5,expiresAt);p.executeUpdate();
+        } return tokenHash;
+    }
+    public synchronized String invitationRole(String tokenHash) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("SELECT role FROM invitations WHERE token_hash=? AND used_at IS NULL AND expires_at>?")){
+            p.setString(1,tokenHash);p.setLong(2,Instant.now().getEpochSecond());try(ResultSet r=p.executeQuery()){return r.next()?r.getString(1):null;}
+        }
+    }
+    public synchronized boolean redeemInvitation(String tokenHash,String username,String salt,String hash) throws SQLException {
+        connection.setAutoCommit(false);
+        try{
+            String role=invitationRole(tokenHash);if(role==null){connection.rollback();return false;}
+            try(PreparedStatement p=connection.prepareStatement("INSERT INTO users(username,salt,password_hash,role,created_at) VALUES(?,?,?,?,?)")){
+                p.setString(1,username);p.setString(2,salt);p.setString(3,hash);p.setString(4,role);p.setLong(5,Instant.now().getEpochSecond());p.executeUpdate();
+            }
+            try(PreparedStatement p=connection.prepareStatement("UPDATE invitations SET used_at=? WHERE token_hash=? AND used_at IS NULL")){
+                p.setLong(1,Instant.now().getEpochSecond());p.setString(2,tokenHash);if(p.executeUpdate()!=1)throw new SQLException("Invitation already used");
+            }
+            connection.commit();return true;
+        }catch(SQLException e){connection.rollback();return false;}finally{connection.setAutoCommit(true);}
+    }
+    public synchronized List<Map<String,Object>> invitations() throws SQLException {
+        List<Map<String,Object>> out=new ArrayList<>();
+        try(Statement s=connection.createStatement();ResultSet r=s.executeQuery("SELECT role,created_by,created_at,expires_at,used_at FROM invitations ORDER BY created_at DESC LIMIT 100")){
+            while(r.next()){Map<String,Object> m=new LinkedHashMap<>();m.put("role",r.getString(1));m.put("createdBy",r.getString(2));m.put("createdAt",r.getLong(3));m.put("expiresAt",r.getLong(4));m.put("used",r.getObject(5)!=null);out.add(m);}
+        }return out;
+    }
+    public synchronized boolean resetUserPassword(String username,String salt,String hash) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("UPDATE users SET salt=?,password_hash=? WHERE username=? AND role!='OWNER'")){
+            p.setString(1,salt);p.setString(2,hash);p.setString(3,username);return p.executeUpdate()==1;
+        }
+    }
+    public synchronized boolean updateUserRole(String username,String role) throws SQLException {
+        if(!(Set.of("ADMINISTRATOR","MODERATOR","VIEWER").contains(role)||customRoleExists(role)))return false;
+        try(PreparedStatement p=connection.prepareStatement("UPDATE users SET role=? WHERE username=? AND role!='OWNER'")){p.setString(1,role);p.setString(2,username);return p.executeUpdate()==1;}
+    }
+    public synchronized boolean createCustomRole(String name,String creator) throws SQLException {
+        if(name==null||!name.matches("[A-Z][A-Z0-9_]{2,31}")||Set.of("OWNER","ADMINISTRATOR","MODERATOR","VIEWER","API_WRITE").contains(name))return false;
+        try(PreparedStatement p=connection.prepareStatement("INSERT INTO custom_roles(name,created_at,created_by) VALUES(?,?,?)")){p.setString(1,name);p.setLong(2,Instant.now().getEpochSecond());p.setString(3,creator);p.executeUpdate();return true;}catch(SQLException e){return false;}
+    }
+    public synchronized boolean customRoleExists(String name) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("SELECT 1 FROM custom_roles WHERE name=?")){p.setString(1,name);try(ResultSet r=p.executeQuery()){return r.next();}}
+    }
+    public synchronized List<String> customRoles() throws SQLException {
+        List<String> out=new ArrayList<>();try(Statement s=connection.createStatement();ResultSet r=s.executeQuery("SELECT name FROM custom_roles ORDER BY name")){while(r.next())out.add(r.getString(1));}return out;
+    }
+    public synchronized void setRolePermission(String role,String permission,boolean enabled) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("INSERT INTO role_permissions(role,permission,enabled) VALUES(?,?,?) ON CONFLICT(role,permission) DO UPDATE SET enabled=excluded.enabled")){
+            p.setString(1,role);p.setString(2,permission);p.setInt(3,enabled?1:0);p.executeUpdate();
+        }
+    }
+    public synchronized boolean hasRolePermission(String role,String permission) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("SELECT enabled FROM role_permissions WHERE role=? AND permission=?")){
+            p.setString(1,role);p.setString(2,permission);try(ResultSet r=p.executeQuery()){return r.next()&&r.getInt(1)==1;}
+        }
+    }
+    public synchronized List<Map<String,Object>> rolePermissions() throws SQLException {
+        List<Map<String,Object>> out=new ArrayList<>();try(Statement s=connection.createStatement();ResultSet r=s.executeQuery("SELECT role,permission,enabled FROM role_permissions ORDER BY role,permission")){
+            while(r.next()){Map<String,Object> m=new LinkedHashMap<>();m.put("role",r.getString(1));m.put("permission",r.getString(2));m.put("enabled",r.getInt(3)==1);out.add(m);}
+        }return out;
+    }
     private String randomToken(int bytes) { byte[] b=new byte[bytes];random.nextBytes(b);return Base64.getUrlEncoder().withoutPadding().encodeToString(b); }
     private static String sha256(String s) throws Exception { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(s.getBytes(StandardCharsets.UTF_8))); }
     private static boolean constantEquals(String a,String b) { return a!=null&&MessageDigest.isEqual(a.getBytes(StandardCharsets.UTF_8),b.getBytes(StandardCharsets.UTF_8)); }

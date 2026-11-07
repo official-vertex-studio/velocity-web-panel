@@ -26,7 +26,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Optional;
 
-@Plugin(id = "vertexvelocitywebpanel", name = "Vertex Velocity Web Panel", version = "4.2.1", description = "Premium live administration panel for Velocity", authors = {"Vertex Studio"})
+@Plugin(id = "vertexvelocitywebpanel", name = "Vertex Velocity Web Panel", version = "5.3.0", description = "Premium live administration panel for Velocity", authors = {"Vertex Studio"})
 public final class VertexVelocityWebPanel {
     private final ProxyServer proxy;
     private final Logger logger;
@@ -56,7 +56,7 @@ public final class VertexVelocityWebPanel {
             this.startedAt = Instant.now();
             this.maintenance = new MaintenanceService(dataDirectory);
             this.motd = new MotdService(dataDirectory);
-            new ProxyCommands(proxy, startedAt).register(this);
+            new ProxyCommands(proxy, startedAt, database).register(this);
             logger.info("Registered proxy-wide commands: /vstats, /vservers, /vplayers, /vserver, /vping, /vhelp");
             this.aliases = new CommandAliasService(proxy, logger, this, dataDirectory);
             int aliasCount = aliases.loadAndRegister();

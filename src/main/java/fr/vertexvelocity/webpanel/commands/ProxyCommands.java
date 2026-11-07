@@ -12,21 +12,27 @@ import net.kyori.adventure.text.format.NamedTextColor;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 import java.util.Optional;
 import java.time.Instant;
+import fr.vertexvelocity.webpanel.db.PanelDatabase;
+import java.sql.SQLException;
 
 public final class ProxyCommands {
     private final ProxyServer proxy;
     private final Instant startedAt;
+    private final PanelDatabase database;
 
-    public ProxyCommands(ProxyServer proxy, Instant startedAt) {
+    public ProxyCommands(ProxyServer proxy, Instant startedAt, PanelDatabase database) {
         this.proxy = proxy;
         this.startedAt = startedAt;
+        this.database = database;
     }
 
     public void register(Object plugin) {
         register(plugin, "vstats", new String[]{"vertexstats"}, this::stats);
+        register(plugin, "vpanel", new String[]{"vertexpanel"}, this::panel);
         register(plugin, "vservers", new String[]{"vertexservers"}, this::servers);
         register(plugin, "vplayers", new String[]{"vertexplayers"}, this::players);
         register(plugin, "vserver", new String[]{"vertexserver"}, this::server);
@@ -70,7 +76,42 @@ public final class ProxyCommands {
             if (!server.getPlayersConnected().isEmpty()) onlineBackends++;
         }
         line(s, "Backends with players: " + onlineBackends, NamedTextColor.GRAY);
+        try { Map<String,Object> history=database.analyticsSummary(1);line(s,"Last 24h · Peak: "+history.getOrDefault("peakPlayers",0)+" · Average: "+history.getOrDefault("averagePlayers",0)+" · Connections: "+history.getOrDefault("connections",0),NamedTextColor.AQUA); } catch(Exception ignored) {}
         line(s, "Use /vservers, /vplayers or /vhelp", NamedTextColor.DARK_GRAY);
+    }
+
+    private void serverStats(CommandSource s,String name){
+        Optional<RegisteredServer> found=proxy.getAllServers().stream().filter(b->b.getServerInfo().getName().equalsIgnoreCase(name)).findFirst();
+        if(found.isEmpty()){line(s,"Unknown backend: "+name,NamedTextColor.RED);return;}
+        RegisteredServer b=found.get();int online=b.getPlayersConnected().size();
+        line(s,"BACKEND · "+b.getServerInfo().getName(),NamedTextColor.LIGHT_PURPLE);
+        line(s,"Connected players: "+online,NamedTextColor.GREEN);
+        line(s,"Registered address: "+b.getServerInfo().getAddress().getHostString()+":"+b.getServerInfo().getAddress().getPort(),NamedTextColor.GRAY);
+        try{Map<String,Object> history=database.analyticsSummary(30);Object rows=history.get("backends");if(rows instanceof List<?> list){for(Object item:list)if(item instanceof Map<?,?> row&&name.equalsIgnoreCase(String.valueOf(row.get("server")))){line(s,"30d availability: "+row.get("availabilityPercent")+"% · Avg latency: "+row.get("averageLatencyMs")+" ms",NamedTextColor.AQUA);break;}}}catch(Exception ignored){}
+        line(s,"Historical samples: web panel → Analytics / Monitoring",NamedTextColor.GRAY);
+    }
+    private void playerStats(CommandSource s,String name){
+        Optional<Player> online=proxy.getPlayer(name);
+        if(online.isPresent()){
+            Player p=online.get();String backend=p.getCurrentServer().map(v->v.getServerInfo().getName()).orElse("Connecting");
+            line(s,"PLAYER · "+p.getUsername(),NamedTextColor.LIGHT_PURPLE);
+            line(s,"Status: ONLINE · Backend: "+backend+" · Ping: "+p.getPing()+" ms",NamedTextColor.GREEN);
+            try{Map<String,Object> profile=database.playerProfile(p.getUniqueId().toString(),20);line(s,"Recorded playtime: "+duration(((Number)profile.getOrDefault("totalPlaySeconds",0L)).longValue()),NamedTextColor.GRAY);line(s,"Recorded sessions: "+profile.getOrDefault("sessionCount",0),NamedTextColor.GRAY);}catch(Exception e){line(s,"Historical profile unavailable.",NamedTextColor.YELLOW);}
+            return;
+        }
+        if(!s.hasPermission("vertexvelocity.command.playerstats")){line(s,"You do not have permission: vertexvelocity.command.playerstats",NamedTextColor.RED);return;}
+        try {
+            Optional<Map<String,Object>> found=database.playerProfileByName(name,30);
+            if(found.isPresent()){Map<String,Object> profile=found.get();line(s,"PLAYER HISTORY · "+profile.get("username"),NamedTextColor.LIGHT_PURPLE);line(s,"Total playtime: "+duration(((Number)profile.getOrDefault("totalPlaySeconds",0L)).longValue()),NamedTextColor.GREEN);line(s,"Recorded sessions: "+profile.getOrDefault("sessionCount",0)+" · Transfers: "+profile.getOrDefault("transferCount",0),NamedTextColor.GRAY);line(s,"Last seen: "+Instant.ofEpochSecond(((Number)profile.getOrDefault("lastSeen",0L)).longValue()),NamedTextColor.GRAY);return;}
+        }catch(Exception ignored){}
+        line(s,"Player is offline or has not been recorded: "+name,NamedTextColor.YELLOW);
+    }
+    private void panel(SimpleCommand.Invocation inv){
+        CommandSource s=inv.source();long uptime=Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond());
+        line(s,"VERTEX PANEL STATUS",NamedTextColor.LIGHT_PURPLE);
+        line(s,"Proxy: ONLINE · Players: "+proxy.getPlayerCount(),NamedTextColor.GREEN);
+        line(s,"Web panel process: ACTIVE",NamedTextColor.GREEN);
+        line(s,"Uptime: "+duration(uptime)+" · Backends: "+proxy.getAllServers().size(),NamedTextColor.GRAY);
     }
 
     private void servers(SimpleCommand.Invocation inv) {
@@ -125,7 +166,10 @@ public final class ProxyCommands {
     private void help(SimpleCommand.Invocation inv) {
         CommandSource s = inv.source();
         line(s, "VERTEX NETWORK COMMANDS", NamedTextColor.LIGHT_PURPLE);
-        line(s, "/vstats - Global proxy statistics", NamedTextColor.GRAY);
+        line(s, "/vstats - Global proxy statistics (24h history)", NamedTextColor.GRAY);
+        line(s, "/vstats serveur <name> - Backend statistics", NamedTextColor.GRAY);
+        line(s, "/vstats joueur <name> - Player activity and playtime", NamedTextColor.GRAY);
+        line(s, "/vpanel - Web panel and proxy status", NamedTextColor.GRAY);
         line(s, "/vservers - Backends and connected player counts", NamedTextColor.GRAY);
         line(s, "/vplayers [backend] - Online player list (permission required)", NamedTextColor.GRAY);
         line(s, "/vserver [player] - Your backend or another player's backend", NamedTextColor.GRAY);
