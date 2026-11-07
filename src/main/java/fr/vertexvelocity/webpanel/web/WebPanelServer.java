@@ -15,20 +15,10 @@ import fr.vertexvelocity.webpanel.security.PasswordUtil;
 import fr.vertexvelocity.webpanel.security.Totp;
 import fr.vertexvelocity.webpanel.service.MaintenanceService;
 import fr.vertexvelocity.webpanel.service.MotdService;
-import fr.vertexvelocity.webpanel.service.TlsCertificateDetector;
-import fr.vertexvelocity.webpanel.service.AcmeCertificateService;
 import fr.vertexvelocity.webpanel.commands.CommandAliasService;
 
 import java.io.*;
 import java.net.*;
-import javax.net.ssl.*;
-import java.security.KeyFactory;
-import java.security.KeyStore;
-import java.security.PrivateKey;
-import java.security.cert.Certificate;
-import java.security.cert.CertificateFactory;
-import java.security.cert.X509Certificate;
-import java.security.spec.PKCS8EncodedKeySpec;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.sql.SQLException;
@@ -44,15 +34,11 @@ public final class WebPanelServer {
     private final Map<String, PendingLogin> pendingLogins = new ConcurrentHashMap<>();
     private final Map<String, ArrayDeque<Long>> loginAttempts = new ConcurrentHashMap<>();
     private final Map<String, FailureState> failedLogins = new ConcurrentHashMap<>();
-    private volatile String lastAcmeError = "No ACME error recorded";
-    private volatile String lastAcmeCheck = "Not checked yet";
-    private volatile String lastCertificateFingerprint = "";
-    private final Map<Boolean, HttpServer> webServers = new ConcurrentHashMap<>();
+    private final Map<String, HttpServer> webServers = new ConcurrentHashMap<>();
     private final ExecutorService webExecutor = new ThreadPoolExecutor(
             4, 32, 60L, TimeUnit.SECONDS, new ArrayBlockingQueue<>(512),
             r -> { Thread t = new Thread(r, "vertex-web-panel-http"); t.setDaemon(true); return t; },
             new ThreadPoolExecutor.CallerRunsPolicy());
-    private AcmeCertificateService acme;
     private final AtomicInteger httpErrors = new AtomicInteger();
     private final MaintenanceService maintenance;
     private final MotdService motd;
@@ -60,56 +46,16 @@ public final class WebPanelServer {
     private final Map<String, BackendHealth> backendHealth = new ConcurrentHashMap<>();
     private final Map<String, Long> alertCooldowns = new ConcurrentHashMap<>();
     private final ExecutorService alertExecutor = Executors.newSingleThreadExecutor(r -> { Thread t = new Thread(r, "vertex-web-panel-alerts"); t.setDaemon(true); return t; });
-    private Path effectiveKeystore;
-    private volatile TlsCertificateDetector.Material tlsMaterial;
     private String activeMode = "HTTP";
 
     public WebPanelServer(ProxyServer proxy, Logger logger, PanelConfig config, PanelDatabase db, Instant startedAt, Path dataDirectory, MaintenanceService maintenance, MotdService motd, CommandAliasService aliases) throws IOException { this.proxy=proxy;this.logger=logger;this.config=config;this.db=db;this.startedAt=startedAt;this.dataDirectory=dataDirectory; this.maintenance = maintenance; this.motd = motd; this.aliases = aliases; }
 
     public void start() throws Exception {
         if (!config.webEnabled()) { logger.info("Web panel is disabled in config.yml"); return; }
-        String requestedMode = config.webMode();
-        if (!Set.of("AUTO", "HTTP", "HTTPS", "BOTH").contains(requestedMode)) throw new IllegalStateException("web-panel.mode must be AUTO, HTTP, HTTPS or BOTH");
-        TlsCertificateDetector detector = new TlsCertificateDetector(dataDirectory);
-        if (config.acmeEnabled()) {
-            acme = new AcmeCertificateService(config, logger, dataDirectory);
-            acme.validateConfiguration();
-            // HTTP-01 validation needs a live HTTP listener before Certbot can request the challenge URL.
-            activeMode = "HTTP";
-            startWebServer(false);
-            int hours = Math.max(6, Math.min(168, config.acmeRenewalCheckHours()));
-            proxy.getScheduler().buildTask(getPluginOwner(), this::checkAcmeRenewal)
-                    .repeat(hours, TimeUnit.HOURS).schedule();
-            logger.info("Automatic ACME enabled for {}. HTTP-01 challenges served from {}; issuance/renewal checked every {} hours.",
-                    config.acmeDomain(), acme.challengeRoot(), hours);
-            // Do not block Velocity's proxy-initialization thread while Certbot performs network validation.
-            Thread initialAcme = new Thread(this::checkAcmeRenewal, "vertex-acme-initial-issuance");
-            initialAcme.setDaemon(true);
-            initialAcme.start();
-        } else {
-            if (!requestedMode.equals("HTTP")) tlsMaterial = detector.detect(config.keystore(), config.keystoreType(), config.keystorePassword(), config.certificate(), config.privateKey()).orElse(null);
-            if (requestedMode.equals("AUTO")) {
-                activeMode = tlsMaterial == null ? "HTTP" : "HTTPS";
-                if (tlsMaterial == null) logger.warn("TLS auto-detection found no usable certificate/private-key pair or keystore. Starting HTTP on port {}. Place fullchain.pem + privkey.pem in the plugin tls/ directory to enable HTTPS automatically.", config.httpPort());
-                else logger.info("TLS auto-detection found a valid certificate (subject={}, expires={}); selecting HTTPS automatically.", tlsMaterial.subject(), tlsMaterial.expiresAt());
-            } else {
-                activeMode = requestedMode;
-                if ((requestedMode.equals("HTTPS") || requestedMode.equals("BOTH")) && tlsMaterial == null) throw new IllegalStateException("HTTPS was explicitly requested but no valid TLS certificate/key pair or usable keystore was detected. Put fullchain.pem + privkey.pem in the plugin tls/ folder or use AUTO mode.");
-            }
-            if (activeMode.equals("BOTH") && config.httpPort() == config.httpsPort()) throw new IllegalStateException("HTTP and HTTPS ports must differ in BOTH mode");
-            try {
-                if (activeMode.equals("HTTP") || activeMode.equals("BOTH")) startWebServer(false);
-                if (activeMode.equals("HTTPS") || activeMode.equals("BOTH")) startWebServer(true);
-            } catch (Exception e) {
-                stopListeners();
-                if (requestedMode.equals("AUTO") && tlsMaterial != null) {
-                    logger.warn("TLS material was discovered but HTTPS could not start. Falling back to HTTP on port {}. Check certificate/key matching, permissions and certificate chain.", config.httpPort(), e);
-                    activeMode = "HTTP";
-                    startWebServer(false);
-                } else throw e;
-            }
-        }
-        if (webServers.isEmpty()) throw new IllegalStateException("No web listener started.");
+        activeMode = "HTTP";
+        // This build is intentionally HTTP-only: no certificate discovery, TLS listener or ACME task.
+        startWebServer();
+        if (webServers.isEmpty()) throw new IllegalStateException("HTTP web listener did not start.");
         long interval = Math.max(5, config.sampleSeconds());
         proxy.getScheduler().buildTask(getPluginOwner(), () -> {
             db.sampleMetric(proxy.getPlayerCount(), proxy.getAllServers().size(), Math.max(0, Instant.now().getEpochSecond() - startedAt.getEpochSecond()));
@@ -120,135 +66,21 @@ public final class WebPanelServer {
         }).repeat(interval, TimeUnit.SECONDS).schedule();
     }
 
-    private synchronized void checkAcmeRenewal() {
-        if (acme == null) return;
-        try {
-            boolean operationOk = tlsMaterial == null ? acme.obtainInitialCertificate() : acme.renew();
-            lastAcmeCheck = Instant.now().toString();
-            if (!operationOk) lastAcmeError = "Certbot did not complete successfully; see the private ACME log files."; else lastAcmeError = "";
-            if (!operationOk) return;
-            TlsCertificateDetector detector = new TlsCertificateDetector(dataDirectory);
-            Optional<TlsCertificateDetector.Material> renewed = detector.detectPemPair(acme.certificatePath(), acme.privateKeyPath());
-            if (renewed.isEmpty()) {
-                logger.error("Certbot completed, but the configured ACME certificate could not be loaded. Keeping the currently running HTTPS listener.");
-                return;
-            }
-            TlsCertificateDetector.Material next = renewed.get();
-            boolean changed = tlsMaterial == null || !next.expiresAt().equals(tlsMaterial.expiresAt()) || !certificateFingerprint(next).equals(lastCertificateFingerprint);
-            lastCertificateFingerprint = certificateFingerprint(next);
-            if (!changed) return;
-            TlsCertificateDetector.Material previous = tlsMaterial;
-            HttpServer old = webServers.remove(true);
-            if (old != null) old.stop(0);
-            tlsMaterial = next;
-            try {
-                startWebServer(true);
-                activeMode = webServers.containsKey(false) ? "BOTH" : "HTTPS";
-                logger.info("HTTPS listener loaded/reloaded with the ACME certificate (expires {}).", next.expiresAt());
-            } catch (Exception reloadFailure) {
-                tlsMaterial = previous;
-                logger.error("Could not start HTTPS with the renewed certificate; attempting to restore the previous HTTPS listener.", reloadFailure);
-                if (previous != null) {
-                    try {
-                        startWebServer(true);
-                        activeMode = webServers.containsKey(false) ? "BOTH" : "HTTPS";
-                        logger.warn("Previous HTTPS certificate listener restored (expires {}).", previous.expiresAt());
-                    } catch (Exception restoreFailure) {
-                        logger.error("Could not restore the previous HTTPS listener. HTTP may remain available if configured.", restoreFailure);
-                    }
-                }
-            }
-        } catch (Exception error) {
-            lastAcmeCheck = Instant.now().toString(); lastAcmeError = error.getClass().getSimpleName()+": "+String.valueOf(error.getMessage());
-            logger.error("Automatic ACME issuance/renewal/reload failed. Detailed error is available in TLS status; inspect private Certbot logs for more information.", error);
-        }
-    }
-
-    /** Starts the embedded JDK HTTP server, avoiding optional web-framework classpath discovery
-     * inside Velocity's plugin classloader. */
-    private void startWebServer(boolean https) throws Exception {
-        int port = https ? config.httpsPort() : config.httpPort();
+    /** Starts the only supported listener: plain HTTP. */
+    private void startWebServer() throws Exception {
         InetAddress bindAddress = InetAddress.getByName(config.bindAddress());
-        HttpServer server = null;
+        HttpServer server = HttpServer.create(new InetSocketAddress(bindAddress, config.httpPort()), 0);
         try {
-            if (https) {
-                if (tlsMaterial == null) throw new IllegalStateException("HTTPS listener requested without detected TLS material");
-                SSLContext sslContext = createSslContext(tlsMaterial);
-                HttpsServer secureServer = HttpsServer.create(new InetSocketAddress(bindAddress, port), 0);
-                server = secureServer;
-                secureServer.setHttpsConfigurator(new HttpsConfigurator(sslContext) {
-                    @Override public void configure(HttpsParameters parameters) {
-                        SSLParameters sslParameters = getSSLContext().getDefaultSSLParameters();
-                        sslParameters.setProtocols(new String[]{"TLSv1.3", "TLSv1.2"});
-                        parameters.setSSLParameters(sslParameters);
-                    }
-                });
-            } else {
-                server = HttpServer.create(new InetSocketAddress(bindAddress, port), 0);
-            }
             server.createContext("/", this::handleExchange);
             server.setExecutor(webExecutor);
             server.start();
-            HttpServer previous = webServers.put(https, server);
+            HttpServer previous = webServers.put("HTTP", server);
             if (previous != null && previous != server) previous.stop(0);
-            logger.info("Vertex Velocity Web Panel {} listener started on {}:{}",
-                    https ? "HTTPS" : "HTTP", config.bindAddress(), port);
+            logger.info("Vertex Velocity Web Panel HTTP listener started on {}:{}", config.bindAddress(), config.httpPort());
         } catch (Exception failure) {
-            if (server != null) try { server.stop(0); } catch (Exception ignored) { }
+            try { server.stop(0); } catch (Exception ignored) { }
             throw failure;
         }
-    }
-
-    private SSLContext createSslContext(TlsCertificateDetector.Material material) throws Exception {
-        char[] password = randomToken().toCharArray();
-        KeyStore keyStore;
-        if (material.kind() == TlsCertificateDetector.Material.Kind.KEYSTORE) {
-            keyStore = KeyStore.getInstance(material.keyStoreType());
-            Path path = material.keyStore();
-            char[] configuredPassword = material.keyStorePassword() == null ? new char[0] : material.keyStorePassword().toCharArray();
-            try (InputStream input = Files.newInputStream(path)) {
-                try { keyStore.load(input, configuredPassword); }
-                catch (Exception firstFailure) {
-                    try (InputStream retry = Files.newInputStream(path)) { keyStore.load(retry, null); }
-                }
-            }
-            password = configuredPassword;
-        } else {
-            CertificateFactory certificateFactory = CertificateFactory.getInstance("X.509");
-            Collection<? extends Certificate> parsedCertificates;
-            try (InputStream certInput = Files.newInputStream(material.certificate())) {
-                parsedCertificates = certificateFactory.generateCertificates(certInput);
-            }
-            if (parsedCertificates.isEmpty()) throw new IllegalArgumentException("TLS certificate file contains no X.509 certificates");
-            Certificate[] chain = parsedCertificates.toArray(Certificate[]::new);
-            PrivateKey privateKey = readPkcs8PrivateKey(material.privateKey());
-            if (privateKey == null) throw new IllegalArgumentException("TLS private key must be an unencrypted PKCS#8 PEM key");
-            keyStore = KeyStore.getInstance("PKCS12");
-            keyStore.load(null, password);
-            keyStore.setKeyEntry("vertex-panel", privateKey, password, chain);
-        }
-        KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-        keyManagers.init(keyStore, password);
-        SSLContext sslContext = SSLContext.getInstance("TLS");
-        sslContext.init(keyManagers.getKeyManagers(), null, new java.security.SecureRandom());
-        return sslContext;
-    }
-
-    private PrivateKey readPkcs8PrivateKey(Path path) throws Exception {
-        String pem = Files.readString(path, StandardCharsets.US_ASCII).trim();
-        String marker = "-----BEGIN PRIVATE KEY-----";
-        String endMarker = "-----END PRIVATE KEY-----";
-        if (!pem.contains(marker) || !pem.contains(endMarker)) {
-            throw new IllegalArgumentException("Unsupported TLS private key format: expected unencrypted PKCS#8 PEM");
-        }
-        String encoded = pem.substring(pem.indexOf(marker) + marker.length(), pem.indexOf(endMarker)).replaceAll("\\s", "");
-        byte[] keyBytes = Base64.getDecoder().decode(encoded);
-        Exception lastFailure = null;
-        for (String algorithm : List.of("RSA", "EC", "Ed25519", "DSA")) {
-            try { return KeyFactory.getInstance(algorithm).generatePrivate(new PKCS8EncodedKeySpec(keyBytes)); }
-            catch (Exception failure) { lastFailure = failure; }
-        }
-        throw new IllegalArgumentException("Could not parse TLS private key", lastFailure);
     }
 
     private Object pluginOwner;
@@ -263,22 +95,13 @@ public final class WebPanelServer {
         try {
             addSecurityHeaders(x); String path=x.getRequestURI().getPath(); String method=x.getRequestMethod().toUpperCase(Locale.ROOT);
             if (hasSessionCookie(x) && !Set.of("GET", "HEAD", "OPTIONS").contains(method) && !csrfOriginAllowed(x)) { json(x, 403, Map.of("error", "CSRF validation failed: Origin must match this panel host.")); return; }
-            if (acme != null && !x.getRequestMethod().equalsIgnoreCase("HEAD")) {
-                Optional<byte[]> challenge = acme.challenge(path);
-                if (challenge.isPresent()) {
-                    byte[] body = challenge.get();
-                    x.getResponseHeaders().set("Content-Type", "text/plain; charset=utf-8");
-                    x.getResponseHeaders().set("Cache-Control", "no-store");
-                    if (body.length == 0) { x.sendResponseHeaders(404, -1); return; }
-                    x.sendResponseHeaders(200, body.length); try (OutputStream out = x.getResponseBody()) { out.write(body); } return;
-                }
-            }
+            if(path.equals("/favicon.ico")){x.getResponseHeaders().set("Cache-Control","public, max-age=86400");x.sendResponseHeaders(204,-1);return;}
             if(path.equals("/")||path.equals("/index.html")){serveResource(x,"/web/index.html","text/html; charset=utf-8");return;}
             if(path.startsWith("/assets/")){
                 if(path.contains("..") || !path.matches("/assets/[A-Za-z0-9_./-]{1,180}")){json(x,400,Map.of("error","Invalid asset path"));return;}
                 serveResource(x,"/web"+path,"application/octet-stream");return;
             }
-            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","4.2.0","timestamp",Instant.now().getEpochSecond()));return;}
+            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","4.2.1","timestamp",Instant.now().getEpochSecond()));return;}
             if(path.equals("/api/v1/setup-status")&&method.equals("GET")){json(x,200,Map.of("needsSetup",db.userCount()==0));return;}
             if(path.equals("/api/v1/setup")&&method.equals("POST")){setup(x);return;}
             if(path.equals("/api/v1/login")&&method.equals("POST")){login(x);return;}
@@ -299,8 +122,7 @@ public final class WebPanelServer {
                 }
             }
             if (!session.apiKey && !Set.of("GET","HEAD","OPTIONS").contains(method) && !Set.of("OWNER","ADMINISTRATOR").contains(session.role) && !(session.role.equals("MODERATOR") && path.startsWith("/api/v1/players/")) && !path.equals("/api/v1/logout")) { json(x,403,Map.of("error","Insufficient role permissions")); return; }
-            if(path.equals("/api/v1/status")&&method.equals("GET")){Map<String,Object> state=new LinkedHashMap<>();state.put("ok",true);state.put("stats",stats());state.put("maintenance",maintenance.view());state.put("motd",motd.view());state.put("tls",tlsStatus());state.put("servers",proxy.getAllServers().size());json(x,200,state);return;}
-            if(path.equals("/api/v1/tls")&&method.equals("GET")){json(x,200,tlsStatus());return;}
+            if(path.equals("/api/v1/status")&&method.equals("GET")){Map<String,Object> state=new LinkedHashMap<>();state.put("ok",true);state.put("stats",stats());state.put("maintenance",maintenance.view());state.put("motd",motd.view());state.put("panelProtocol","HTTP");state.put("servers",proxy.getAllServers().size());json(x,200,state);return;}
             if(path.equals("/api/v1/2fa")&&method.equals("GET")){json(x,200,Map.of("enabled",db.totpEnabled(session.username)));return;}
             if(path.equals("/api/v1/2fa/setup")&&method.equals("POST")){String secret=Totp.newBase32Secret();db.createPendingTotp(session.username,secret);db.audit(session.username,"TOTP_SETUP_STARTED",session.username,clientIp(x),"Pending TOTP secret created");json(x,200,Map.of("secret",secret,"otpauthUri",Totp.uri(session.username,secret),"message","Add this account to your authenticator app, then confirm with a current six-digit code."));return;}
             if(path.equals("/api/v1/2fa/enable")&&method.equals("POST")){Map<?,?> b=body(x);String secret=db.pendingTotpSecret(session.username);if(secret==null||!Totp.verify(secret,string(b,"code",""))){json(x,400,Map.of("error","Invalid code or no pending setup. Start setup again."));return;}List<String> recoveryCodes=new ArrayList<>();List<String> recoveryHashes=new ArrayList<>();for(int i=0;i<10;i++){String recovery=java.util.UUID.randomUUID().toString().replace("-", "").substring(0,16).toUpperCase(Locale.ROOT);recoveryCodes.add(recovery.substring(0,4)+"-"+recovery.substring(4,8)+"-"+recovery.substring(8,12)+"-"+recovery.substring(12));recoveryHashes.add(PanelDatabase.hashApiKey(recovery));}db.enableTotp(session.username,recoveryHashes);db.audit(session.username,"TOTP_ENABLED",session.username,clientIp(x),"TOTP enabled; 10 one-time recovery codes generated");json(x,200,Map.of("ok",true,"enabled",true,"recoveryCodes",recoveryCodes,"warning","Save these recovery codes now. They are shown only once; each code can be used once."));return;}
@@ -429,7 +251,7 @@ public final class WebPanelServer {
         String token=randomToken();long expiry=Instant.now().getEpochSecond()+config.sessionMinutes()*60L;sessions.put(token,new Session(username,role,expiry,false,false));
         db.audit(username,"LOGIN_SUCCESS",null,ip,"Web panel login");x.getResponseHeaders().add("Set-Cookie",sessionCookie(token,config.sessionMinutes()*60,x));json(x,200,Map.of("ok",true,"username",username,"role",role,"expiresAt",expiry));
     }
-    private String sessionCookie(String token,long maxAge,HttpExchange x){boolean secure=(x instanceof HttpsExchange)||config.reverseProxyMode();return "vv_session="+token+"; Path=/; HttpOnly; SameSite=Strict"+(secure?"; Secure":"")+"; Max-Age="+maxAge;}
+    private String sessionCookie(String token,long maxAge,HttpExchange x){return "vv_session="+token+"; Path=/; HttpOnly; SameSite=Strict; Max-Age="+maxAge;}
     private void logout(HttpExchange x) throws IOException {String token=cookie(x,"vv_session");if(token!=null){Session s=sessions.remove(token);if(s!=null)db.audit(s.username,"LOGOUT",null,clientIp(x),"Web panel logout");}x.getResponseHeaders().add("Set-Cookie",sessionCookie("",0,x));json(x,200,Map.of("ok",true));}
     private Session authenticate(HttpExchange x){
         String authorization=x.getRequestHeaders().getFirst("Authorization");
@@ -455,7 +277,7 @@ public final class WebPanelServer {
     private boolean isProgressivelyBlocked(String ip) { FailureState s=failedLogins.get(ip); if(s==null)return false; if(System.currentTimeMillis()-s.lastFailure>900_000L){failedLogins.remove(ip,s);return false;} return s.blockedUntil>System.currentTimeMillis(); }
     private long retryAfter(String ip) { FailureState s=failedLogins.get(ip);return s==null?0:Math.max(1,(s.blockedUntil-System.currentTimeMillis()+999)/1000); }
     private boolean hasSessionCookie(HttpExchange x) { return cookie(x,"vv_session") != null; }
-    private boolean csrfOriginAllowed(HttpExchange x) { String origin=x.getRequestHeaders().getFirst("Origin"), host=x.getRequestHeaders().getFirst("Host"); if(origin==null||host==null)return false; try { URI u=URI.create(origin); return u.getHost()!=null && host.equalsIgnoreCase(u.getRawAuthority()) && ("http".equalsIgnoreCase(u.getScheme())||"https".equalsIgnoreCase(u.getScheme())); } catch(Exception e){return false;} }
+    private boolean csrfOriginAllowed(HttpExchange x) { String origin=x.getRequestHeaders().getFirst("Origin"), host=x.getRequestHeaders().getFirst("Host"); if(origin==null||host==null)return false; try { URI u=URI.create(origin); return u.getHost()!=null && host.equalsIgnoreCase(u.getRawAuthority()) && "http".equalsIgnoreCase(u.getScheme()); } catch(Exception e){return false;} }
 
     private Path velocityTomlPath() { Path p=dataDirectory.toAbsolutePath();Path plugins=p.getParent();Path root=plugins==null?null:plugins.getParent();return root==null?p.resolve("velocity.toml"):root.resolve("velocity.toml"); }
     private Map<String,Object> readRouting() throws IOException {
@@ -815,11 +637,11 @@ public final class WebPanelServer {
 
     private Map<String,Object> diagnosticsView() throws Exception {
         Map<String,Object> d=new LinkedHashMap<>();
-        d.put("pluginVersion","4.2.0");d.put("javaVersion",System.getProperty("java.version"));
+        d.put("pluginVersion","4.2.1");d.put("javaVersion",System.getProperty("java.version"));
         d.put("javaVendor",System.getProperty("java.vendor"));d.put("os",System.getProperty("os.name")+" "+System.getProperty("os.version"));
         d.put("processors",Runtime.getRuntime().availableProcessors());d.put("jvmUsedBytes",Runtime.getRuntime().totalMemory()-Runtime.getRuntime().freeMemory());
         d.put("jvmMaxBytes",Runtime.getRuntime().maxMemory());d.put("uptimeSeconds",Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond()));
-        d.put("databaseHealthy",db.healthCheck());d.put("databaseType","SQLite");d.put("httpListeners",webServers.keySet().stream().map(v->v?"HTTPS":"HTTP").sorted().toList());
+        d.put("databaseHealthy",db.healthCheck());d.put("databaseType","SQLite");d.put("httpListeners",webServers.isEmpty()?List.of():List.of("HTTP"));
         d.put("backendHealth",serversView().stream().map(row->{Map<String,Object> safe=new LinkedHashMap<>();safe.put("name",row.get("name"));safe.put("health",row.get("health"));safe.put("playerCount",row.get("playerCount"));safe.put("latencyMs",row.get("latencyMs"));return safe;}).toList());d.put("requestErrors",httpErrors.get());
         d.put("warning","Diagnostics omit credentials, webhook URLs, private keys, filesystem paths and API secrets.");
         return d;
@@ -842,7 +664,7 @@ public final class WebPanelServer {
                 "type", String.valueOf(e.get("type")), "timestamp", e.get("timestamp") == null ? 0L : e.get("timestamp"))).toList());
         bundle.put("recentAdminActionTypes", db.auditLogs(100).stream().map(a -> Map.of(
                 "action", String.valueOf(a.get("action")), "timestamp", a.get("timestamp") == null ? 0L : a.get("timestamp"))).toList());
-        bundle.put("note", "Sanitized support bundle. It excludes player names/UUIDs, client IPs, audit targets/details, passwords, API keys, cookies, webhook URLs, TLS private keys, backend addresses and filesystem paths.");
+        bundle.put("note", "Sanitized support bundle. It excludes player names/UUIDs, client IPs, audit targets/details, passwords, API keys, cookies, webhook URLs, backend addresses and filesystem paths.");
         return bundle;
     }
 
@@ -1044,9 +866,9 @@ public final class WebPanelServer {
     private void updateConfig(HttpExchange x,Session session) throws Exception {
         Map<?,?> body=body(x);
         config.updateEditable(body);
-        Map<String,Object> saved=new LinkedHashMap<>(); saved.put("mode",config.webMode()); saved.put("bindAddress",config.bindAddress()); saved.put("httpPort",config.httpPort()); saved.put("httpsPort",config.httpsPort()); saved.put("httpsEnabled",config.httpsEnabled()); saved.put("sampleSeconds",config.sampleSeconds()); saved.put("retentionDays",config.retentionDays());
+        Map<String,Object> saved=new LinkedHashMap<>(); saved.put("mode",config.webMode()); saved.put("bindAddress",config.bindAddress()); saved.put("httpPort",config.httpPort()); saved.put("sampleSeconds",config.sampleSeconds()); saved.put("retentionDays",config.retentionDays());
         db.audit(session.username,"CONFIG_UPDATE",null,clientIp(x),gson.toJson(saved));
-        json(x,202,Map.of("ok",true,"message","Settings saved to config.yml. Listener, TLS, and bind changes require a proxy restart; data collection settings also take effect after restart.","restartRequired",true,"accepted",saved));
+        json(x,202,Map.of("ok",true,"message","Settings saved to config.yml. HTTP listener and bind changes require a proxy restart; data collection settings also take effect after restart.","restartRequired",true,"accepted",saved));
     }
     private void createApiKey(HttpExchange x,Session session) throws Exception {
         Map<?,?> b=body(x);String name=string(b,"name","").trim();String scope=string(b,"scope","READ").trim().toUpperCase(Locale.ROOT);
@@ -1098,38 +920,6 @@ public final class WebPanelServer {
         if (s.apiKey) { if (!s.apiWrite) throw new ForbiddenException(); return; }
         if (!s.role.equals("OWNER") && !s.role.equals("ADMINISTRATOR")) throw new ForbiddenException();
     }
-    private String certificateFingerprint(TlsCertificateDetector.Material material) {
-        try {
-            java.security.cert.X509Certificate certificate;
-            if (material.kind() == TlsCertificateDetector.Material.Kind.PEM) {
-                try (InputStream in = Files.newInputStream(material.certificate())) { certificate = (java.security.cert.X509Certificate) java.security.cert.CertificateFactory.getInstance("X.509").generateCertificate(in); }
-            } else {
-                java.security.KeyStore store = java.security.KeyStore.getInstance(material.keyStoreType());
-                try (InputStream in = Files.newInputStream(material.keyStore())) { store.load(in, material.keyStorePassword()==null?new char[0]:material.keyStorePassword().toCharArray()); }
-                certificate = null; var aliases = store.aliases(); while (aliases.hasMoreElements()) { var cert=store.getCertificate(aliases.nextElement()); if(cert instanceof java.security.cert.X509Certificate x) { certificate=x; break; } }
-                if(certificate==null)return "";
-            }
-            byte[] digest=java.security.MessageDigest.getInstance("SHA-256").digest(certificate.getEncoded());
-            return java.util.HexFormat.of().formatHex(digest);
-        } catch(Exception e) { return ""; }
-    }
-
-    private Map<String,Object> tlsStatus() {
-        Map<String,Object> result = new LinkedHashMap<>();
-        result.put("requestedMode", config.webMode());
-        result.put("activeMode", activeMode);
-        result.put("httpsAvailable", activeMode.equals("HTTPS") || activeMode.equals("BOTH"));
-        result.put("certificateDetected", tlsMaterial != null);
-        result.put("httpsPort", config.httpsPort());
-        result.put("httpPort", config.httpPort());
-        result.put("acmeEnabled", config.acmeEnabled());
-        result.put("acmeLastCheck", lastAcmeCheck); result.put("acmeLastError", lastAcmeError); result.put("certificateFingerprint", lastCertificateFingerprint.isBlank()?null:lastCertificateFingerprint);
-        result.put("reverseProxyMode", config.reverseProxyMode());
-        result.put("tlsTermination", config.reverseProxyMode()?"TRUSTED_REVERSE_PROXY":"PANEL_LISTENER");
-        if (config.acmeEnabled()) result.put("acmeDomain", config.acmeDomain());
-        if (tlsMaterial != null) result.put("certificate", tlsMaterial.view());
-        return result;
-    }
     private void requireRole(HttpExchange x,Session s,String... roles) throws ForbiddenException {if(Arrays.stream(roles).noneMatch(r->r.equals(s.role)))throw new ForbiddenException();}
     private Map<?,?> body(HttpExchange x) throws IOException {if(x.getRequestBody()==null)return Map.of();byte[] data=x.getRequestBody().readNBytes(1_048_577);if(data.length>1_048_576)throw new IOException("Request body too large");if(data.length==0)return Map.of();Object o=gson.fromJson(new String(data,StandardCharsets.UTF_8),Object.class);if(!(o instanceof Map<?,?> m))throw new IOException("Expected JSON object");return m;}
     private int queryInt(HttpExchange x,String key,int fallback){try{return Integer.parseInt(query(x).getOrDefault(key,String.valueOf(fallback)));}catch(Exception e){return fallback;}}
@@ -1145,7 +935,6 @@ public final class WebPanelServer {
         h.set("Cross-Origin-Opener-Policy","same-origin"); h.set("Cross-Origin-Resource-Policy","same-origin");
         h.set("Content-Security-Policy","default-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'");
         h.set("Cache-Control","no-store");
-        if (x instanceof HttpsExchange) h.set("Strict-Transport-Security","max-age=31536000; includeSubDomains");
     }
     private void serveResource(HttpExchange x,String resource,String type)throws IOException{
         try(InputStream in=getClass().getResourceAsStream(resource)){

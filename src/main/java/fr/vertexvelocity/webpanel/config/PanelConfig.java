@@ -37,6 +37,7 @@ public final class PanelConfig {
         }
         PanelConfig config = new PanelConfig(file, map);
         config.mergeDefaults();
+        config.removeLegacyTransportConfig();
         config.save();
         restrictFilePermissions(file);
         return config;
@@ -65,6 +66,14 @@ public final class PanelConfig {
             }
         }
     }
+    private synchronized void removeLegacyTransportConfig() {
+        Map<String,Object> web = section("web-panel");
+        web.remove("https");
+        web.remove("https-port");
+        web.remove("reverse-proxy");
+        web.put("mode", "HTTP");
+        root.remove("acme");
+    }
     public synchronized void save() throws IOException {
         DumperOptions options = new DumperOptions(); options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK); options.setPrettyFlow(true); options.setIndent(2);
         try (Writer writer = Files.newBufferedWriter(file)) { new Yaml(options).dump(root, writer); }
@@ -74,24 +83,10 @@ public final class PanelConfig {
         try { Files.setPosixFilePermissions(target, Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)); }
         catch (UnsupportedOperationException | IOException ignored) { /* Non-POSIX filesystem: retain platform ACLs. */ }
     }
-    public synchronized String webMode() { return str(section("web-panel"), "mode", "AUTO").toUpperCase(java.util.Locale.ROOT); }
+    public synchronized String webMode() { return "HTTP"; }
     public synchronized boolean webEnabled() { return bool(section("web-panel"), "enabled", true); }
     public synchronized String bindAddress() { return str(section("web-panel"), "bind-address", "127.0.0.1"); }
     public synchronized int httpPort() { return integer(section("web-panel"), "http-port", 25569); }
-    public synchronized int httpsPort() { return integer(section("web-panel"), "https-port", 8443); }
-    public synchronized boolean httpsEnabled() { return bool(child(section("web-panel"), "https"), "enabled", false); }
-    public synchronized String keystore() { return str(child(section("web-panel"), "https"), "keystore", ""); }
-    public synchronized String keystorePassword() { return str(child(section("web-panel"), "https"), "keystore-password", ""); }
-    public synchronized String keystoreType() { return str(child(section("web-panel"), "https"), "keystore-type", "PKCS12"); }
-    public synchronized String certificate() { return str(child(section("web-panel"), "https"), "certificate", ""); }
-    public synchronized String privateKey() { return str(child(section("web-panel"), "https"), "private-key", ""); }
-    public synchronized boolean acmeEnabled() { return bool(section("acme"), "enabled", false); }
-    public synchronized String acmeDomain() { return str(section("acme"), "domain", "").trim().toLowerCase(java.util.Locale.ROOT); }
-    public synchronized String acmeEmail() { return str(section("acme"), "email", "").trim(); }
-    public synchronized String certbotCommand() { return str(section("acme"), "certbot-command", "certbot").trim(); }
-    public synchronized int acmeRenewalCheckHours() { return integer(section("acme"), "renewal-check-hours", 12); }
-    public synchronized boolean acmeStaging() { return bool(section("acme"), "staging", false); }
-    public synchronized boolean reverseProxyMode() { return bool(section("web-panel"), "reverse-proxy", false); }
     public synchronized int sessionMinutes() { return integer(section("security"), "session-minutes", 60); }
     public synchronized int loginAttemptsPerMinute() { return integer(section("security"), "login-attempts-per-minute", 8); }
     public synchronized int sampleSeconds() { return integer(section("statistics"), "sample-seconds", 15); }
@@ -112,37 +107,17 @@ public final class PanelConfig {
 
     public synchronized void updateEditable(Map<?, ?> values) throws IOException {
         Map<String,Object> web = section("web-panel");
-        Map<String,Object> tls = child(web, "https");
         Map<String,Object> security = section("security");
         Map<String,Object> stats = section("statistics");
         Map<String,Object> monitoring = section("monitoring");
-        if (values.containsKey("mode")) {
-            String mode = String.valueOf(values.get("mode")).toUpperCase(java.util.Locale.ROOT);
-            if (!java.util.Set.of("AUTO", "HTTP", "HTTPS", "BOTH").contains(mode)) throw new IllegalArgumentException("Mode must be AUTO, HTTP, HTTPS or BOTH");
-            web.put("mode", mode);
-        }
+        web.put("mode", "HTTP");
         if (values.containsKey("bindAddress")) {
             String address = String.valueOf(values.get("bindAddress")).trim();
             if (address.isBlank() || address.length() > 255 || address.contains(" ")) throw new IllegalArgumentException("Bind address is invalid");
             web.put("bind-address", address);
         }
         putPort(values, "httpPort", web, "http-port");
-        putPort(values, "httpsPort", web, "https-port");
         if (values.containsKey("webEnabled")) web.put("enabled", Boolean.parseBoolean(String.valueOf(values.get("webEnabled"))));
-        if (values.containsKey("httpsEnabled")) tls.put("enabled", Boolean.parseBoolean(String.valueOf(values.get("httpsEnabled"))));
-        if (values.containsKey("keystore")) tls.put("keystore", String.valueOf(values.get("keystore")).trim());
-        if (values.containsKey("keystoreType")) {
-            String type = String.valueOf(values.get("keystoreType")).toUpperCase(java.util.Locale.ROOT);
-            if (!java.util.Set.of("PKCS12", "JKS").contains(type)) throw new IllegalArgumentException("Keystore type must be PKCS12 or JKS");
-            tls.put("keystore-type", type);
-        }
-        if (values.containsKey("certificate")) tls.put("certificate", String.valueOf(values.get("certificate")).trim());
-        if (values.containsKey("privateKey")) tls.put("private-key", String.valueOf(values.get("privateKey")).trim());
-        if (values.containsKey("keystorePassword") && !String.valueOf(values.get("keystorePassword")).isEmpty()) {
-            String password = String.valueOf(values.get("keystorePassword"));
-            if (password.length() > 512) throw new IllegalArgumentException("Keystore password is too long");
-            tls.put("keystore-password", password);
-        }
         putBounded(values, "sampleSeconds", stats, "sample-seconds", 5, 3600);
         putBounded(values, "retentionDays", stats, "retention-days", 1, 3650);
         putBounded(values, "loginAttemptsPerMinute", security, "login-attempts-per-minute", 3, 60);
@@ -150,9 +125,9 @@ public final class PanelConfig {
         putBounded(values, "highLatencyMs", monitoring, "high-latency-ms", 100, 60000);
         putBounded(values, "alertCooldownSeconds", monitoring, "alert-cooldown-seconds", 30, 86400);
         putBounded(values, "alertHistoryLimit", monitoring, "alert-history-limit", 100, 10000);
-        String mode = webMode();
-        if (mode.equals("BOTH") && httpPort() == httpsPort()) throw new IllegalArgumentException("HTTP and HTTPS ports must be different in BOTH mode");
-        if ((mode.equals("HTTPS") || mode.equals("BOTH")) && !httpsEnabled()) throw new IllegalArgumentException("Enable HTTPS before selecting HTTPS or BOTH mode");
+        web.remove("https");
+        root.remove("acme");
+        web.put("mode", "HTTP");
         save();
     }
 
@@ -176,16 +151,9 @@ public final class PanelConfig {
     public synchronized Map<String,Object> publicView() {
         Map<String,Object> result = new LinkedHashMap<>();
         Map<String,Object> web = new LinkedHashMap<>(section("web-panel"));
-        Map<String,Object> nestedTls = new LinkedHashMap<>(child(section("web-panel"), "https"));
-        // TLS material is discovered server-side. Never expose local filesystem paths or passwords.
-        nestedTls.remove("keystore-password");
-        nestedTls.remove("keystore");
-        nestedTls.remove("certificate");
-        nestedTls.remove("private-key");
-        web.put("https", nestedTls);
+        web.remove("https");
+        web.put("mode", "HTTP");
         result.put("web-panel", web);
-        Map<String,Object> tls = new LinkedHashMap<>(nestedTls);
-        result.put("https", tls);
         result.put("statistics", new LinkedHashMap<>(section("statistics"))); result.put("security", new LinkedHashMap<>(section("security")));
         result.put("monitoring", new LinkedHashMap<>(section("monitoring")));
         result.put("discord", Map.of("enabled", discordEnabled(), "webhook-configured", !discordWebhook().isBlank())); return result;
