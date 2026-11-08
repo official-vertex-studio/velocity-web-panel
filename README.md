@@ -43,20 +43,13 @@ The plugin creates `plugins/vertexvelocitywebpanel/config.yml`. The web panel us
 ```yaml
 web-panel:
   enabled: true
-  mode: HTTP # HTTP by default; AUTO, HTTPS, or BOTH can be enabled later
+  mode: HTTP # Set to HTTPS to enable automatic certificate detection
   bind-address: 127.0.0.1
   http-port: 25569
-  https-port: 8443
-  https:
-    enabled: true
-    keystore: '' # optional; AUTO detects PEM certificates and keystores
-    keystore-password: '' # only needed for a protected keystore
-    keystore-type: PKCS12
-    certificate: '' # optional PEM override
-    private-key: '' # optional PEM override
+  reverse-proxy: false
 ```
 
-For remote administration, use a trusted HTTPS certificate or a properly secured reverse proxy, restrict network access, and never expose an unencrypted HTTP listener directly to the public internet. Keep the keystore password and initial setup token private.
+For remote administration, use a trusted HTTPS certificate or a properly secured reverse proxy, restrict network access, and never expose an unencrypted HTTP listener directly to the public internet. Keep the initial setup token private.
 
 ## Native Velocity server management
 
@@ -66,6 +59,10 @@ The backend manager edits the `[servers]` section of the proxy's native `velocit
 - Changes to backend registry entries are applied to the running Velocity registry where supported by the operation.
 - Fallback-order changes are written to `velocity.toml` and require a Velocity restart to take effect.
 - Restoring a configuration backup changes the file on disk; restart Velocity to apply the restored configuration consistently.
+
+## Automatic HTTPS (5.6.0)
+
+Set `web-panel.mode: HTTPS`. The plugin automatically detects a valid Certbot certificate under `/etc/letsencrypt/live`, checks the certificate/key pair and domain lineage, and hot-reloads renewed files about every 30 seconds without restarting Velocity. Certbot's system timer remains responsible for issuing renewals. If no usable certificate is found, the plugin reuses or generates a local self-signed fallback; browsers will warn because that fallback is not publicly trusted. No certificate paths or passwords need to be configured. See `docs/SECURITY-AND-TLS-HARDENING.md` for permissions and operational details.
 
 ## Security guidance
 
@@ -122,41 +119,19 @@ Supported placeholders: `{player}`, `{uuid}`, `{server}`, `{args}`, `{arg1}`, `{
 
 ### Maintenance, MOTD and TLS files
 
-Runtime YAML files are stored in `plugins/vertexvelocitywebpanel/`: `config.yml`, `maintenance.yml`, `motd.yml`, `tls.yml`, and `aliases.yml`. Default templates are bundled under `src/main/resources/defaults/`; runtime changes are persisted to the plugin data directory.
+Runtime YAML files are stored in `plugins/vertexvelocitywebpanel/`: `config.yml`, `maintenance.yml`, `motd.yml`, and `aliases.yml`. Default templates are bundled under `src/main/resources/defaults/`; runtime changes are persisted to the plugin data directory.
 
 Maintenance enforcement runs at Velocity pre-login. With maintenance enabled and whitelist enforcement enabled, UUIDs not in the whitelist are denied. `allow-existing-players` controls reconnect/pre-login behavior for players already online, and `kick-existing-players` can disconnect non-whitelisted players when maintenance is enabled. The whitelist uses UUIDs as its canonical identity; the API can resolve a `playerName` only while that player is online.
 
 Authenticated API routes include `GET /api/v1/status`, `GET /api/v1/maintenance`, `GET /api/v1/maintenance/status`, `PUT /api/v1/maintenance`, `GET /api/v1/motd`, `GET /api/v1/motd/preview`, and `PUT /api/v1/motd`. API keys can be created with `scope: READ` or `scope: READ_WRITE`. READ_WRITE keys can only call an explicit safe allowlist: backend probes, alert acknowledgement and predefined Command Center actions. They cannot change proxy configuration, moderate players or manage accounts, backends or API keys.
 
-With `web-panel.mode: AUTO`, TLS is discovered at startup without filling in a path. The detector checks `plugins/vertexvelocitywebpanel/tls/`, the plugin data folder, `./tls`, common Let's Encrypt/system certificate directories, and additional roots in `tls.yml`. Supported PEM pairs include `fullchain.pem` + `privkey.pem` and `tls.crt` + `tls.key`; existing PKCS12/PFX/JKS keystores are also detected. PEM certificates do not require a keystore password. HTTPS uses the configured HTTPS port (8443 by default).
+With `web-panel.mode: HTTPS`, TLS is fully automatic. At startup the plugin first searches the standard Certbot directory `/etc/letsencrypt/live/*/` for a valid `fullchain.pem` + `privkey.pem` pair. It verifies certificate dates, the trusted issuer chain, the SAN/domain lineage and the private-key match before using it. No certificate paths or passwords need to be entered. If no usable Certbot certificate is found, the plugin reuses its own `tls/keystore.p12`; if that does not exist or is invalid, it generates and stores a self-signed certificate automatically. The generated certificate is reused on later starts. The plugin checks Certbot files every 30 seconds and hot-reloads renewed certificates for new HTTPS connections without restarting Velocity. Certbot's system timer or cron job performs the actual renewal.
 
-#### Automatic ACME / Let's Encrypt
-
-The plugin can automatically request and renew a public certificate through **Certbot** using ACME HTTP-01 validation. Certbot must be installed and executable inside the same Pterodactyl container/runtime as the plugin. In `plugins/vertexvelocitywebpanel/config.yml`, configure the `acme` section:
-
-```yaml
-web-panel:
-  bind-address: 0.0.0.0
-  http-port: 80       # or a container port that public TCP/80 is forwarded to
-  https-port: 8443
-  mode: HTTP
-acme:
-  enabled: true
-  domain: panel.example.com
-  email: admin@example.com
-  certbot-command: certbot
-  renewal-check-hours: 12
-```
-
-Replace the example domain and email. The domain's public DNS A/AAAA records must point to this server, and inbound **TCP port 80** must reach the plugin's HTTP listener (directly or through a reverse proxy that forwards `/.well-known/acme-challenge/` unchanged). Do not configure a public AAAA record unless IPv6 reaches this listener too. The plugin serves HTTP-01 challenge files, requests the initial certificate, checks renewal on the configured interval, and attempts to reload its embedded HTTPS listener when the certificate expiry changes.
-
-Certbot's configuration, work files, logs, webroot and issued certificates are stored under `plugins/vertexvelocitywebpanel/acme/` so the plugin does not hard-code `/etc/letsencrypt` or require root merely to write its certificate store. However, **Certbot itself must still be installed and executable** in the runtime, and the process must be able to bind/listen on the configured ports. A standard Pterodactyl container often does not include Certbot; the plugin cannot install it into the container or open host firewall/allocations. Failed issuance is logged and retried on a later check. Do not expose authenticated panel traffic over plain HTTP; for production, use a trusted reverse proxy to serve HTTPS and forward only the ACME challenge path to the plugin's HTTP listener, or firewall normal HTTP traffic.
-
-This is a Certbot-backed integration, not a bundled ACME protocol implementation. Before public use, test DNS, HTTP-01 reachability, initial issuance, renewal and listener reload on a staging domain. A successful Certbot exit alone does not prove that the public route or browser HTTPS works.
+A self-signed certificate encrypts traffic but is not trusted by browsers, which will show a security warning. For a public panel without that warning, install Certbot on the host and make its certificate directory readable by the Velocity process. The plugin does not install Certbot or request a public certificate itself: public certificate issuance still requires domain validation and host-level access. When multiple Certbot lineages are present, the plugin selects only a certificate whose SAN matches the machine canonical hostname; if it cannot disambiguate them, it uses the fallback rather than selecting another domain's certificate. The panel's HTTPS listener uses the configured `http-port` as its listening port.
 
 ## Release validation and limitations
 
-See [`docs/REMAINING-VALIDATION.md`](docs/REMAINING-VALIDATION.md) for TOTP recovery-code behavior, ACME deployment requirements, settings that require a Velocity restart, and the mandatory Java 25 / real-proxy release checklist. The checklist is not evidence that those tests have already passed.
+See [`docs/REMAINING-VALIDATION.md`](docs/REMAINING-VALIDATION.md) for TOTP recovery-code behavior, automatic TLS certificate detection, settings that require a Velocity restart, and the mandatory Java 25 / real-proxy release checklist. The checklist is not evidence that those tests have already passed.
 
 
 ## 🚨 Operations & Reliability 4.2

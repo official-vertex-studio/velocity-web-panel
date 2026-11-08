@@ -8,54 +8,30 @@
 4. Create separate named accounts and grant only the role each operator needs.
 5. Do not share the owner account. Account management and administrative actions are written to the audit log.
 
-Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes, not plaintext. Login attempts are rate-limited per observed client IP. Session cookies are HttpOnly and SameSite=Strict; direct HTTPS connections additionally use Secure cookies.
+Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes, not plaintext. Login attempts are rate-limited per observed client IP, per account and globally, with progressive temporary blocking and capped concurrent password hashing. Session cookies are HttpOnly and SameSite=Strict; direct HTTPS connections additionally use Secure cookies.
 
 ## HTTP / HTTPS configuration
 
-The Settings page can save the following options to the plugin `config.yml`: enabled state, HTTP/HTTPS/BOTH mode, bind address, ports, TLS keystore path/type, sample interval, retention, login attempt limit and session lifetime. The plugin does not hot-rebind sockets: restart Velocity after changing the listener, bind or TLS options. Existing PEM certificates are accepted only when the certificate is currently valid and the unencrypted PKCS#8 private key cryptographically matches it. Automatic ACME issuance/renewal is available through Certbot HTTP-01 when `acme.enabled` is enabled. Certbot must be installed in the same runtime, the public domain must resolve to the proxy, and public TCP/80 must reach the challenge handler. See the README ACME setup instructions. This integration does not install Certbot or manage host-level permissions.
+Set `web-panel.mode: HTTPS` in `config.yml`. No certificate path, private-key path, or keystore password is required. On startup the plugin searches the standard Certbot location `/etc/letsencrypt/live/*/` and validates a discovered `fullchain.pem` + `privkey.pem` pair. If no usable Certbot certificate is found, it reuses its own `tls/keystore.p12` or creates a self-signed certificate automatically. The generated certificate is retained and reused on subsequent starts.
 
-Example private HTTP listener (recommended only on localhost or a trusted private network):
+The plugin checks the active Certbot files every 30 seconds and hot-reloads a renewed certificate for new HTTPS connections without restarting Velocity. Certbot's own systemd timer or cron job remains responsible for the actual renewal. The Velocity process must be able to read the Certbot certificate and private-key files. The plugin does not install Certbot or obtain public certificates itself. A self-signed certificate provides encryption but causes browser trust warnings; use a host-installed Certbot certificate for a browser-trusted public HTTPS endpoint. With one Certbot lineage, its directory name must match a certificate SAN. With multiple lineages, the machine canonical hostname must match a certificate SAN to disambiguate them; otherwise the plugin uses the fallback rather than guessing.
+
+Example:
 
 ```yaml
 web-panel:
   enabled: true
-  mode: HTTP
-  bind-address: 127.0.0.1
-  http-port: 8084
-  https-port: 8443
-  https:
-    enabled: false
-    keystore: ''
-    keystore-password: ''
-    keystore-type: PKCS12
-```
-
-To prepare a PKCS12 keystore for a direct HTTPS test, use a JDK `keytool` command on a trusted machine and replace the example values with your own hostname and password:
-
-```bash
-keytool -genkeypair -alias vertex-panel -keyalg RSA -keysize 3072 -validity 365 -storetype PKCS12 -keystore vertex-panel.p12 -dname "CN=panel.example.com"
-```
-
-Copy the keystore to a protected path on the proxy host, then configure:
-
-```yaml
-web-panel:
   mode: HTTPS
-  bind-address: 127.0.0.1
-  https-port: 8443
-  https:
-    enabled: true
-    keystore: '/absolute/path/to/vertex-panel.p12'
-    keystore-password: 'YOUR_KEYSTORE_PASSWORD'
-    keystore-type: PKCS12
+  bind-address: 0.0.0.0
+  http-port: 25569
 ```
 
-A self-signed certificate is suitable for a local test only and will show browser trust warnings. For a public domain, use a certificate issued for that domain and restrict access with firewall rules. If TLS is terminated by a reverse proxy, keep this plugin bound to localhost and configure HTTPS at the reverse proxy; do not expose the backend HTTP port publicly. Avoid committing `config.yml` or keystore files to source control.
+For a reverse proxy that terminates TLS, keep the plugin in `HTTP` mode and set `web-panel.reverse-proxy: true` only when the upstream proxy is trusted and cannot be bypassed by untrusted clients. Restart Velocity after changing the listener mode.
 
 ## Important limitations
 
 - HTTP sends credentials over the network without transport encryption. Use it only on localhost or a trusted network.
-- Changes to the listener and TLS configuration require a full Velocity restart. The web interface reports this requirement after saving.
+- Changes to listener mode, bind address or port require a full Velocity restart. Renewed certificate files are hot-reloaded automatically while HTTPS remains enabled.
 - Maintenance mode can deny new Velocity logins when enabled. UUID whitelist enforcement is configurable; test it on a staging proxy before enabling it on a production network.
 - Do not treat the current plugin as tested for public production use until the shaded JAR is built with the target JDK and tested on a real Velocity proxy.
 

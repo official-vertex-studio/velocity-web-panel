@@ -12,7 +12,7 @@ The Java code is grouped by responsibility:
 
 ## Runtime configuration
 
-The JAR's `src/main/resources/defaults/` files are templates only. Runtime settings belong in the plugin data directory. Do not edit resources inside the JAR after packaging. Existing `config.yml` remains the source for listener settings; `maintenance.yml` stores maintenance state and UUID whitelist. `motd.yml` is loaded by `MotdService` and applied to Velocity ping responses. `tls.yml` supplies extra search roots for automatic TLS asset discovery. The listener selects HTTP/HTTPS at startup; changing listener ports or TLS assets requires a restart. PEM discovery validates certificate dates and verifies that an unencrypted PKCS#8 private key matches the certificate. ACME issuance/renewal is integrated through Certbot HTTP-01 when explicitly enabled; this depends on Certbot being installed in the runtime and public TCP/80 reaching the challenge handler. TOTP recovery codes are implemented.
+The JAR's `src/main/resources/defaults/` files are templates only. Runtime settings belong in the plugin data directory. Do not edit resources inside the JAR after packaging. Existing `config.yml` remains the source for listener settings; `maintenance.yml` stores maintenance state and UUID whitelist. `motd.yml` is loaded by `MotdService` and applied to Velocity ping responses. When HTTPS is enabled, the listener automatically checks Certbot lineages under `/etc/letsencrypt/live`, validates the certificate chain, hostname lineage, file permissions and private-key match, and otherwise reuses or generates a self-signed fallback keystore. Renewed Certbot files are detected every 30 seconds and hot-reloaded for new TLS connections. Certbot's own system timer/cron remains responsible for certificate issuance and renewal; the plugin does not implement ACME issuance. Changing listener mode, bind address or port requires a restart. TOTP recovery codes are implemented.
 
 ## API maintenance routes
 
@@ -47,7 +47,6 @@ src/main/resources/
 ├── defaults/config.yml               # Main config template
 ├── defaults/maintenance.yml          # Maintenance defaults
 ├── defaults/motd.yml                 # MOTD profiles
-├── defaults/tls.yml                  # TLS search-path defaults
 └── web/index.html                    # Embedded dashboard
 ```
 
@@ -55,7 +54,7 @@ The `defaults/*.yml` files are the single source of truth for newly generated co
 
 ## Management API additions
 
-- `GET /api/v1/status` — authenticated combined snapshot of stats, MOTD, maintenance, TLS detection and server count.
+- `GET /api/v1/status` — authenticated combined snapshot of stats, MOTD, maintenance, panel protocol and server count.
 - `GET /api/v1/motd` and `GET /api/v1/motd/preview` — current MOTD configuration and selected profile.
 - `PUT /api/v1/motd` — validate, atomically persist and apply MOTD configuration immediately (owner/admin browser session only).
 - `GET /api/v1/maintenance` and `GET /api/v1/maintenance/status` — maintenance state, UUID whitelist size and online counts.
@@ -66,9 +65,15 @@ The `defaults/*.yml` files are the single source of truth for newly generated co
 
 All management endpoints require authentication. API keys have explicit `READ` or `READ_WRITE` scope. `READ_WRITE` keys do not inherit administrator identity and are limited to backend probes, alert acknowledgements and the predefined safe Command Center actions (`probe_backends`, `reload_aliases`, `database_check`). Configuration changes and player moderation require an authorized interactive browser session.
 
-## TLS discovery
+## TLS certificate handling
 
-`web-panel.mode: AUTO` searches the plugin `tls/` folder, plugin data folder, `./tls`, common Let's Encrypt and system TLS directories, plus extra directories in `tls.yml`. Supported PEM pairs include `fullchain.pem` + `privkey.pem`, `tls.crt` + `tls.key` and other documented names. Existing PKCS12/PFX/JKS keystores are also checked. A valid PEM certificate does not require a keystore password. AUTO chooses HTTPS when a valid unexpired asset is found; otherwise it falls back to HTTP with a warning. When `acme.enabled: true`, the plugin also integrates with Certbot for initial HTTP-01 issuance, scheduled renewal checks and HTTPS listener reload. See the README for DNS, port-forwarding, Certbot installation and permission requirements.
+Set `web-panel.mode: HTTPS`. The plugin scans `/etc/letsencrypt/live/*/` for Certbot `fullchain.pem` and `privkey.pem`, validates certificate dates, issuer chain and Java trust path, verifies the private-key match, and checks the SAN against the Certbot lineage name or canonical host name. With one lineage, its directory name must match a certificate SAN; with multiple lineages, the machine canonical hostname must match a SAN to disambiguate them, otherwise the plugin uses its fallback. If no usable Certbot certificate is found, the plugin reuses `tls/keystore.p12` or generates a self-signed fallback.
+
+The Certbot systemd timer/cron job performs renewal. The plugin checks the files every 30 seconds and updates the reloadable TLS key manager for new connections without restarting Velocity. The Velocity service user must be able to read the Certbot private key; the plugin does not weaken host permissions. A self-signed fallback encrypts traffic but browsers will show a trust warning.
+
+## Login protection
+
+Login and initial setup use per-IP throttles. Login also uses per-account and global request limits, progressive temporary blocks after repeated failures, dummy PBKDF2 work for unknown usernames, and a semaphore to cap concurrent password hashing. TOTP failures contribute to the same progressive IP/account blocking state.
 
 ## Validation status and manual acceptance tests
 
@@ -80,5 +85,5 @@ The source archive integrity is not equivalent to a successful Java build. Befor
 4. Enable `kick-existing-players`, remove a connected player's UUID, and confirm the player is disconnected.
 5. Change MOTD using the API; confirm the next Minecraft server-list ping uses the new profile and that `motd.yml` survives restart.
 6. Use a `READ` API key against a write route (expect 403), then use `READ_WRITE` against an explicitly supported write route (expect success), and verify owner-only routes remain denied.
-7. Test TLS with a valid PEM pair, a mismatched key, an expired certificate, an encrypted keystore without a password and no certificate at all. AUTO must never report HTTPS active unless the HTTPS listener started successfully.
+7. Test TLS with one matching Certbot lineage, multiple unrelated lineages, a SAN mismatch, a mismatched private key, an expired certificate, unreadable private-key permissions, a renewed Certbot symlink target and no Certbot certificate. Verify that renewed files take effect on new connections without restarting Velocity and that the fallback is reported as self-signed.
 8. Test alias reload with valid, invalid, reserved and colliding command names.

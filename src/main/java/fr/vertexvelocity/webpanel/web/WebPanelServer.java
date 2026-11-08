@@ -15,6 +15,7 @@ import fr.vertexvelocity.webpanel.security.PasswordUtil;
 import fr.vertexvelocity.webpanel.security.Totp;
 import fr.vertexvelocity.webpanel.service.MaintenanceService;
 import fr.vertexvelocity.webpanel.service.MotdService;
+import fr.vertexvelocity.webpanel.service.TlsCertificateDetector;
 import fr.vertexvelocity.webpanel.commands.CommandAliasService;
 
 import java.io.*;
@@ -48,6 +49,11 @@ public final class WebPanelServer {
     private final Map<String, Long> alertCooldowns = new ConcurrentHashMap<>();
     private final ExecutorService alertExecutor = Executors.newSingleThreadExecutor(r -> { Thread t = new Thread(r, "vertex-web-panel-alerts"); t.setDaemon(true); return t; });
     private String activeMode = "HTTP";
+    private volatile javax.net.ssl.SSLContext activeTlsContext;
+    private volatile TlsCertificateDetector.Selection activeTlsSelection;
+    private TlsCertificateDetector tlsDetector;
+    private volatile long lastTlsExpiryWarningAt;
+    private volatile long lastTlsRefreshDiagnosticAt;
 
     public WebPanelServer(ProxyServer proxy, Logger logger, PanelConfig config, PanelDatabase db, Instant startedAt, Path dataDirectory, MaintenanceService maintenance, MotdService motd, CommandAliasService aliases) throws IOException { this.proxy=proxy;this.logger=logger;this.config=config;this.db=db;this.startedAt=startedAt;this.dataDirectory=dataDirectory; this.maintenance = maintenance; this.motd = motd; this.aliases = aliases; }
 
@@ -64,9 +70,13 @@ public final class WebPanelServer {
             probeBackends();
             cleanupSecurityState();
         }).repeat(interval, TimeUnit.SECONDS).schedule();
+        if ("HTTPS".equals(activeMode)) {
+            proxy.getScheduler().buildTask(getPluginOwner(), this::refreshTlsIfChanged)
+                    .repeat(30, TimeUnit.SECONDS).schedule();
+        }
     }
 
-    /** Starts the listener: plain HTTP (optionally behind a TLS reverse proxy) or direct HTTPS from a keystore. */
+    /** Starts the listener: plain HTTP (optionally behind a TLS reverse proxy) or direct HTTPS with automatic certificate selection. */
     private void startWebServer() throws Exception {
         InetAddress bindAddress = InetAddress.getByName(config.bindAddress());
         InetSocketAddress socket = new InetSocketAddress(bindAddress, config.httpPort());
@@ -75,7 +85,14 @@ public final class WebPanelServer {
         try {
             if (tls) {
                 javax.net.ssl.SSLContext context = buildSslContext();
+                activeTlsContext = context;
                 ((HttpsServer) server).setHttpsConfigurator(new HttpsConfigurator(context) {
+                    // HttpsServer asks the configurator for the context when creating TLS engines.
+                    // Returning the volatile context allows Certbot renewals to take effect without rebinding the port.
+                    @Override public javax.net.ssl.SSLContext getSSLContext() {
+                        javax.net.ssl.SSLContext current = activeTlsContext;
+                        return current == null ? super.getSSLContext() : current;
+                    }
                     @Override public void configure(HttpsParameters params) {
                         javax.net.ssl.SSLParameters sslParameters = getSSLContext().getDefaultSSLParameters();
                         sslParameters.setProtocols(new String[]{"TLSv1.3", "TLSv1.2"});
@@ -100,17 +117,67 @@ public final class WebPanelServer {
     private static boolean isLoopback(InetAddress address) { return address.isLoopbackAddress(); }
 
     private javax.net.ssl.SSLContext buildSslContext() throws Exception {
-        Path keystore = Path.of(config.httpsKeystore());
-        if (!keystore.isAbsolute()) keystore = dataDirectory.toAbsolutePath().resolve(keystore).normalize();
-        if (!Files.isRegularFile(keystore)) throw new IllegalStateException("web-panel.mode is HTTPS but the keystore was not found: " + keystore);
-        char[] password = config.httpsKeystorePassword().toCharArray();
-        java.security.KeyStore store = java.security.KeyStore.getInstance(config.httpsKeystoreType());
-        try (InputStream in = Files.newInputStream(keystore)) { store.load(in, password); }
-        javax.net.ssl.KeyManagerFactory factory = javax.net.ssl.KeyManagerFactory.getInstance(javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm());
-        factory.init(store, password);
-        javax.net.ssl.SSLContext context = javax.net.ssl.SSLContext.getInstance("TLS");
-        context.init(factory.getKeyManagers(), null, null);
-        return context;
+        tlsDetector = new TlsCertificateDetector(dataDirectory);
+        TlsCertificateDetector.Selection selection = tlsDetector.createSslContext(
+                config.httpsKeystore(), config.httpsKeystoreType(), config.httpsKeystorePassword());
+        activeTlsSelection = selection;
+        logTlsSelection(selection, true);
+        return selection.context();
+    }
+
+    private void refreshTlsIfChanged() {
+        TlsCertificateDetector detector = tlsDetector;
+        if (detector == null || !"HTTPS".equals(activeMode)) return;
+        try {
+            TlsCertificateDetector.Selection candidate = detector.createSslContext(
+                    config.httpsKeystore(), config.httpsKeystoreType(), config.httpsKeystorePassword());
+            TlsCertificateDetector.Selection current = activeTlsSelection;
+            String discoveryDiagnostic = detector.lastDiagnostic();
+            if (!discoveryDiagnostic.isBlank() && System.currentTimeMillis() - lastTlsRefreshDiagnosticAt > 10L * 60 * 1000) {
+                lastTlsRefreshDiagnosticAt = System.currentTimeMillis();
+                logger.warn("TLS certificate discovery/refresh diagnostic: {}", discoveryDiagnostic);
+            }
+            if (current != null && Objects.equals(current.fingerprint(), candidate.fingerprint())) {
+                warnIfCertificateNearExpiry(current);
+                return;
+            }
+            // A temporary permission/read error must not downgrade a working Certbot certificate
+            // to the plugin's self-signed fallback. Keep the last known-good TLS context instead.
+            if (current != null && current.source().contains("Certbot")
+                    && !candidate.source().contains("Certbot") && current.expiresAt().isAfter(Instant.now())) {
+                String diagnostic = detector.lastDiagnostic();
+                if (!diagnostic.isBlank() && System.currentTimeMillis() - lastTlsRefreshDiagnosticAt > 10L * 60 * 1000) {
+                    lastTlsRefreshDiagnosticAt = System.currentTimeMillis();
+                    logger.warn("TLS certificate refresh skipped; keeping the active Certbot certificate: {}", diagnostic);
+                }
+                return;
+            }
+            activeTlsContext = candidate.context();
+            activeTlsSelection = candidate;
+            logTlsSelection(candidate, false);
+        } catch (Exception error) {
+            logger.warn("Could not refresh the HTTPS certificate. The currently active TLS context remains in use.", error);
+        }
+    }
+
+    private void logTlsSelection(TlsCertificateDetector.Selection selection, boolean startup) {
+        logger.info("HTTPS certificate {}: {} | subject={} | expires={}",
+                startup ? "selected" : "reloaded", selection.source(), selection.subject(), selection.expiresAt());
+        if (selection.source().contains("self-signed")) {
+            logger.warn("The panel is using an automatically generated self-signed certificate. HTTPS is encrypted, but browsers will show a certificate warning; a trusted Let's Encrypt certificate is required for a warning-free browser connection.");
+        }
+        String diagnostic = tlsDetector == null ? "" : tlsDetector.lastDiagnostic();
+        if (!diagnostic.isBlank()) logger.warn("TLS certificate discovery diagnostic: {}", diagnostic);
+        warnIfCertificateNearExpiry(selection);
+    }
+
+    private void warnIfCertificateNearExpiry(TlsCertificateDetector.Selection selection) {
+        long secondsLeft = selection.expiresAt().getEpochSecond() - Instant.now().getEpochSecond();
+        if (secondsLeft <= 30L * 24 * 60 * 60 && System.currentTimeMillis() - lastTlsExpiryWarningAt > 6L * 60 * 60 * 1000) {
+            lastTlsExpiryWarningAt = System.currentTimeMillis();
+            logger.warn("HTTPS certificate expires in approximately {} day(s) ({}). Check Certbot renewal and file permissions.",
+                    Math.max(0, secondsLeft / 86400), selection.expiresAt());
+        }
     }
 
     /** True while at least one listener is running (used by /vpanel). */
@@ -134,7 +201,7 @@ public final class WebPanelServer {
                 if(path.contains("..") || !path.matches("/assets/[A-Za-z0-9_./-]{1,180}")){json(x,400,Map.of("error","Invalid asset path"));return;}
                 serveResource(x,"/web"+path,"application/octet-stream");return;
             }
-            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","4.2.1","timestamp",Instant.now().getEpochSecond()));return;}
+            if(path.equals("/api/v1/health")&&method.equals("GET")){json(x,200,Map.of("ok",true,"plugin","Vertex Velocity Web Panel","version","5.6.0","timestamp",Instant.now().getEpochSecond()));return;}
             if(path.equals("/api/v1/setup-status")&&method.equals("GET")){json(x,200,Map.of("needsSetup",db.userCount()==0));return;}
             if(path.equals("/api/v1/setup")&&method.equals("POST")){setup(x);return;}
             if(path.equals("/api/v1/login")&&method.equals("POST")){login(x);return;}
@@ -270,29 +337,54 @@ public final class WebPanelServer {
     }
 
     private void setup(HttpExchange x) throws Exception {
+        String ip = clientIp(x);
+        if (!allowBucket("setup:" + ip, 5) || !allowBucket("setup-global", 30)) { x.getResponseHeaders().set("Retry-After", "60"); json(x, 429, Map.of("error", "Too many setup attempts. Try again later.")); return; }
         if(db.userCount()>0){json(x,409,Map.of("error","Owner account already exists"));return;}
         Map<?,?> body=body(x);String token=string(body,"setupToken","");String username=string(body,"username","");String password=string(body,"password","");
         if(password.length()<12||password.length()>256){json(x,400,Map.of("error","Password must be 12 to 256 characters"));return;}
-        String salt=PasswordUtil.newSalt(),hash=PasswordUtil.hash(password,salt);
-        if(!db.setupOwner(token,username,salt,hash)){json(x,400,Map.of("error","Invalid setup token or username"));return;}
-        db.audit(username,"OWNER_CREATED",username,clientIp(x),"Initial owner created");json(x,201,Map.of("ok",true,"message","Owner created. Sign in now."));
+        if (!hashPermits.tryAcquire()) { x.getResponseHeaders().set("Retry-After", "5"); json(x, 503, Map.of("error", "Server busy. Try again shortly.")); return; }
+        boolean created;
+        try { String salt=PasswordUtil.newSalt(),hash=PasswordUtil.hash(password,salt); created=db.setupOwner(token,username,salt,hash); }
+        finally { hashPermits.release(); }
+        if(!created){json(x,400,Map.of("error","Invalid setup token or username"));return;}
+        db.audit(username,"OWNER_CREATED",username,ip,"Initial owner created");json(x,201,Map.of("ok",true,"message","Owner created. Sign in now."));
     }
+
     private void login(HttpExchange x) throws Exception {
-        String ip=clientIp(x); if(!allowAttempt(ip)){json(x,429,Map.of("error","Too many login attempts. Try again later."));return;} if (isProgressivelyBlocked(ip)) { json(x,429,Map.of("error","Login temporarily blocked after repeated failures.","retryAfterSeconds",retryAfter(ip))); return; }
-        Map<?,?> body=body(x);String username=string(body,"username","");String password=string(body,"password","");
+        String ip=clientIp(x);
+        if(!allowAttempt(ip) || !allowBucket("login-global", 300)) { x.getResponseHeaders().set("Retry-After", "60"); json(x,429,Map.of("error","Too many login attempts. Try again later."));return; }
+        Map<?,?> body=body(x);String username=string(body,"username","").trim();String password=string(body,"password","");
+        String userKey = "login-user:" + username.toLowerCase(Locale.ROOT);
+        if (username.isBlank() || username.length() > 32 || !allowBucket(userKey, 20)) { x.getResponseHeaders().set("Retry-After", "60"); json(x,429,Map.of("error","Too many login attempts for this account. Try again later."));return; }
+        if (isProgressivelyBlocked(ip) || isProgressivelyBlocked("user:" + username.toLowerCase(Locale.ROOT))) {
+            long retry = Math.max(retryAfter(ip), retryAfter("user:" + username.toLowerCase(Locale.ROOT)));
+            x.getResponseHeaders().set("Retry-After", String.valueOf(retry));
+            json(x,429,Map.of("error","Login temporarily blocked after repeated failures.","retryAfterSeconds",retry));return;
+        }
+        if(password.length()>256){recordFailedLogin(ip);recordFailedLogin("user:" + username.toLowerCase(Locale.ROOT));json(x,401,Map.of("error","Invalid username or password"));return;}
         Optional<UserRecord> found=db.findUser(username);
-        if(password.length()>256){recordFailedLogin(ip);json(x,401,Map.of("error","Invalid username or password"));return;}
-        if(found.isEmpty()||found.get().disabled()||!PasswordUtil.verify(password,found.get().salt(),found.get().passwordHash())){recordFailedLogin(ip);db.audit(username,"LOGIN_FAILED",null,ip,"Invalid credentials");json(x,401,Map.of("error","Invalid username or password"));return;}
-        failedLogins.remove(ip); UserRecord user=found.get();
+        if (!hashPermits.tryAcquire()) { x.getResponseHeaders().set("Retry-After", "5"); json(x, 503, Map.of("error", "Authentication is busy. Try again shortly.")); return; }
+        boolean valid;
+        try {
+            // Perform a PBKDF2 operation even for unknown accounts to reduce username-enumeration timing leaks.
+            valid = found.isPresent() ? PasswordUtil.verify(password, found.get().salt(), found.get().passwordHash())
+                    : !PasswordUtil.hash(password, "MDEyMzQ1Njc4OWFiY2RlZg==").isEmpty();
+        } finally { hashPermits.release(); }
+        if(found.isEmpty()||found.get().disabled()||!valid){recordFailedLogin(ip);recordFailedLogin("user:" + username.toLowerCase(Locale.ROOT));db.audit(username,"LOGIN_FAILED",null,ip,"Invalid credentials");json(x,401,Map.of("error","Invalid username or password"));return;}
+        failedLogins.remove(ip); failedLogins.remove("user:" + username.toLowerCase(Locale.ROOT)); UserRecord user=found.get();
         if(db.totpEnabled(user.username())){long now=Instant.now().getEpochSecond();pendingLogins.entrySet().removeIf(e->e.getValue().expiresAt<now);String challenge=randomToken();pendingLogins.put(challenge,new PendingLogin(user.username(),user.role(),now+300,ip));json(x,202,Map.of("requiresTotp",true,"challengeId",challenge,"message","Enter the six-digit code from your authenticator app."));return;}
         createSession(x,user.username(),user.role(),ip);
     }
+
     private void completeTotpLogin(HttpExchange x) throws Exception {
-        String ip=clientIp(x);if(!allowAttempt(ip)){json(x,429,Map.of("error","Too many login attempts. Try again later."));return;} if (isProgressivelyBlocked(ip)) { json(x,429,Map.of("error","Login temporarily blocked after repeated failures.","retryAfterSeconds",retryAfter(ip))); return; }
+        String ip=clientIp(x);if(!allowAttempt(ip) || !allowBucket("login-global", 300)){x.getResponseHeaders().set("Retry-After","60");json(x,429,Map.of("error","Too many login attempts. Try again later."));return;}
+        if (isProgressivelyBlocked(ip)) { json(x,429,Map.of("error","Login temporarily blocked after repeated failures.","retryAfterSeconds",retryAfter(ip))); return; }
         Map<?,?> b=body(x);String id=string(b,"challengeId","");String code=string(b,"code","");PendingLogin pending=pendingLogins.get(id);
         if(pending==null||pending.expiresAt<Instant.now().getEpochSecond()||!pending.ip.equals(ip)){pendingLogins.remove(id);json(x,401,Map.of("error","Authentication challenge expired or does not match this client. Sign in again."));return;}
-        String secret=db.totpSecret(pending.username);boolean valid=secret!=null&&Totp.verify(secret,code);if(!valid&&code!=null){String normalized=code.replace("-", "").replace(" ", "").toUpperCase(Locale.ROOT);if(normalized.matches("[A-F0-9]{16}")){valid=db.consumeTotpRecoveryCode(pending.username,PanelDatabase.hashApiKey(normalized));if(valid)db.audit(pending.username,"TOTP_RECOVERY_USED",pending.username,ip,"One-time TOTP recovery code consumed");}}if(!valid){recordFailedLogin(ip);db.audit(pending.username,"LOGIN_2FA_FAILED",null,ip,"Invalid TOTP or recovery code");json(x,401,Map.of("error","Invalid authenticator or recovery code"));return;}
-        failedLogins.remove(ip);
+        String userKey = "user:" + pending.username.toLowerCase(Locale.ROOT);
+        if (isProgressivelyBlocked(userKey)) { long retry=retryAfter(userKey); x.getResponseHeaders().set("Retry-After",String.valueOf(retry)); json(x,429,Map.of("error","Login temporarily blocked after repeated failures.","retryAfterSeconds",retry)); return; }
+        String secret=db.totpSecret(pending.username);boolean valid=secret!=null&&Totp.verify(secret,code);if(!valid&&code!=null){String normalized=code.replace("-", "").replace(" ", "").toUpperCase(Locale.ROOT);if(normalized.matches("[A-F0-9]{16}")){valid=db.consumeTotpRecoveryCode(pending.username,PanelDatabase.hashApiKey(normalized));if(valid)db.audit(pending.username,"TOTP_RECOVERY_USED",pending.username,ip,"One-time TOTP recovery code consumed");}}if(!valid){recordFailedLogin(ip);recordFailedLogin(userKey);db.audit(pending.username,"LOGIN_2FA_FAILED",null,ip,"Invalid TOTP or recovery code");json(x,401,Map.of("error","Invalid authenticator or recovery code"));return;}
+        failedLogins.remove(ip); failedLogins.remove(userKey);
         pendingLogins.remove(id);
         Optional<UserRecord> account=db.findUser(pending.username);
         if(account.isEmpty()||account.get().disabled()){json(x,401,Map.of("error","Authentication challenge expired or does not match this client. Sign in again."));return;}
@@ -714,6 +806,12 @@ public final class WebPanelServer {
             synchronized(attempts){while(!attempts.isEmpty() && millis-attempts.peekFirst()>60_000L)attempts.removeFirst();if(attempts.isEmpty())loginAttempts.remove(entry.getKey(),attempts);}
         }
         alertCooldowns.entrySet().removeIf(entry -> entry.getValue() < now-config.alertCooldownSeconds()*4L);
+        if (loginAttempts.size() > 10000) {
+            loginAttempts.entrySet().removeIf(entry -> {
+                ArrayDeque<Long> q = entry.getValue();
+                synchronized (q) { return q.isEmpty() || millis - q.peekLast() > 60_000L; }
+            });
+        }
     }
 
     private void raiseAlert(String severity,String dedupeKey,String title,String message) {
@@ -744,7 +842,7 @@ public final class WebPanelServer {
 
     private Map<String,Object> diagnosticsView() throws Exception {
         Map<String,Object> d=new LinkedHashMap<>();
-        d.put("pluginVersion","4.2.1");d.put("javaVersion",System.getProperty("java.version"));
+        d.put("pluginVersion","5.6.0");d.put("javaVersion",System.getProperty("java.version"));
         d.put("javaVendor",System.getProperty("java.vendor"));d.put("os",System.getProperty("os.name")+" "+System.getProperty("os.version"));
         d.put("processors",Runtime.getRuntime().availableProcessors());d.put("jvmUsedBytes",Runtime.getRuntime().totalMemory()-Runtime.getRuntime().freeMemory());
         d.put("jvmMaxBytes",Runtime.getRuntime().maxMemory());d.put("uptimeSeconds",Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond()));

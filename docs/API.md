@@ -41,8 +41,7 @@ Revokes a key. The next request using it will fail authentication. A key cannot 
 | Method | Route | Purpose |
 |---|---|---|
 | GET | `/health` | Public health and version info |
-| GET | `/status` | Authenticated combined stats, MOTD, maintenance and TLS detection snapshot |
-| GET | `/tls` | Authenticated active listener mode and detected certificate metadata |
+| GET | `/status` | Authenticated combined stats, MOTD, maintenance and panel protocol snapshot |
 | GET | `/motd` | Read normal/maintenance MOTD profiles |
 | GET | `/motd/preview` | Read the selected MOTD profile based on maintenance state |
 | GET | `/setup-status` | Whether initial setup is required |

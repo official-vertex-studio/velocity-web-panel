@@ -1,47 +1,31 @@
-# Security and TLS hardening (2.1.0 work-in-progress)
+# Security and TLS hardening — 5.6.0
 
-## Authentication protections
+## Automatic HTTPS certificate handling
 
-- IP request rate limit remains configured by `security.login-attempts-per-minute`.
-- Failed password/TOTP attempts now add progressive temporary blocks (from 30 seconds, capped at 15 minutes); the failure state is in memory and resets on restart.
-- Cookie-authenticated state-changing requests must include an `Origin` matching the request `Host`. Cookie flags include `HttpOnly`, `SameSite=Strict`, and `Secure` when the panel listener is HTTPS or `web-panel.reverse-proxy: true`.
-- Owner-only `POST /api/v1/sessions/revoke-all` revokes all web sessions. A successful login always creates a fresh cryptographically random session token.
-- Role checks deny mutation requests to VIEWER/MODERATOR roles; sensitive endpoints retain their more specific owner/admin checks.
-- ACME state directories are restricted to owner-only POSIX permissions when supported. Certbot failure output is suppressed from normal logs to reduce accidental disclosure.
+When `web-panel.mode: HTTPS` is enabled, the plugin scans `/etc/letsencrypt/live/*/` for Certbot lineages containing `fullchain.pem` and `privkey.pem`. It verifies certificate validity dates, the leaf-to-issuer chain signatures, the certificate path against the Java trust store, private-key readability, and cryptographic matching between the private key and the leaf certificate. With one lineage, the leaf certificate SAN must match its directory name. With multiple lineages, the machine canonical hostname must match a certificate SAN to disambiguate them; otherwise the plugin uses its fallback rather than guessing.
 
-## ACME staging and HTTP-01
+The plugin checks the certificate every 30 seconds. Certbot's own systemd timer or cron job remains responsible for renewal. After Certbot updates its live symlinks/files, the plugin updates its reloadable TLS key manager so new HTTPS connections use the renewed certificate without rebinding the listener or restarting Velocity. Existing TLS sessions continue until their normal connection lifecycle ends.
 
-Set `acme.staging: true` to use Let’s Encrypt staging for issuance/renewal tests. Staging certificates are intentionally not trusted by browsers. Switch it back to `false` only after a successful staging run. The plugin serves `/.well-known/acme-challenge/<token>` from its private webroot.
+If no usable Certbot certificate is available, the plugin reuses `tls/keystore.p12` or creates a self-signed fallback in the plugin data directory. The fallback encrypts traffic but is not publicly trusted; browsers display a certificate warning. It may also not match a public DNS hostname the plugin cannot discover. A browser-trusted public endpoint requires a valid certificate issued for the exact hostname users visit.
 
-For HTTP-01 to succeed, the configured public domain must resolve to this host and inbound TCP port 80 must reach the plugin HTTP listener (directly or through a reverse proxy forwarding that path). A container allocation or firewall cannot be opened by the plugin itself. Verify from outside the hosting network that `http://YOUR_DOMAIN/.well-known/acme-challenge/test` reaches the panel challenge handler (a missing token should return 404, not the website homepage).
+The Velocity service account must be able to read both Certbot files, especially `privkey.pem`. If Velocity runs inside a Pterodactyl/container environment while Certbot runs on the host, `/etc/letsencrypt` must be mounted into the container and readable there; the plugin cannot read host files that are not exposed to its process. The plugin deliberately does not weaken `/etc/letsencrypt` permissions automatically. If access is denied, it logs a diagnostic and keeps the last known-good Certbot context during a transient refresh failure; on first startup it uses the local fallback instead. Certificates expiring within 30 days generate a throttled warning in the proxy log. No certificate path, keystore path, or password needs to be entered in `config.yml`; set only `web-panel.mode: HTTPS`.
 
-The panel reports active mode, certificate expiry, SHA-256 fingerprint, last ACME check and last error via authenticated `GET /api/v1/tls` and `/api/v1/status`. Certificate replacement is only attempted after the detector verifies validity and private-key matching; listener reload failure attempts to restore the previous listener.
+## Login abuse protection
 
-## Pterodactyl reverse-proxy mode
+Login and initial setup are rate-limited per client IP. Login additionally has per-account and global request buckets, progressive temporary blocking after repeated credential failures, and a semaphore limiting concurrent PBKDF2 password checks. Unknown usernames still perform a dummy PBKDF2 operation to reduce timing-based account enumeration. Two-factor failures contribute to the same progressive IP/account blocking state. The in-memory rate-limit state is periodically pruned; the global login bucket limits attacker-controlled per-account bucket growth.
 
-If Certbot is unavailable in the game-server container, disable plugin ACME and terminate HTTPS at a trusted host/provider reverse proxy (for example, the hosting provider’s managed proxy). Set `web-panel.reverse-proxy: true` so session cookies use `Secure`, and bind the panel to a private/local interface such as `127.0.0.1` if the proxy shares the same network namespace. Configure the reverse proxy to forward `/api/` and static assets to the panel and to enforce HTTPS externally. Do not enable `trust-proxy-headers` unless the proxy is trusted and strips/replaces client-supplied forwarding headers. Never expose the backend HTTP port publicly in this mode.
+## Reverse proxy mode
+
+If Nginx, Caddy, or a hosting provider terminates HTTPS, keep the plugin listener in HTTP mode and set `web-panel.reverse-proxy: true`. Only trust forwarded headers from explicitly configured proxy addresses. The proxy must prevent untrusted clients from bypassing the public TLS endpoint and reaching the upstream listener directly.
+
+## Session and API security
+
+- Session cookies are HttpOnly and SameSite=Strict; the Secure flag is enabled for direct HTTPS or configured trusted reverse-proxy mode.
+- State-changing cookie-authenticated requests must pass the Origin check.
+- Keep the panel bound to loopback or a private interface unless access is protected by a firewall or trusted reverse proxy.
+- Do not expose API keys, setup tokens, webhook URLs, or passwords in logs or public repositories.
+- Restrict access to the plugin data directory. The generated keystore is written with owner-only POSIX permissions where supported.
 
 ## Validation status
 
-This is implementation documentation, not a claim of production validation. This environment did not have Maven installed and only had JDK 21, while the project targets Java 25. A real ACME staging issuance/renewal and a live reverse-proxy test still need to be run on the target host.
-
-## Additional hardening in 2.1.0
-
-- Browser session rotation is available at `POST /api/v1/session/rotate`. It invalidates the token presented by the browser and returns a fresh HttpOnly cookie. API-key callers cannot use this endpoint.
-- Owner-only global session revocation is available at `POST /api/v1/sessions/revoke-all`; the Security Center exposes a confirmation action. This intentionally signs every browser out.
-- Cookie `Secure` is enabled for direct HTTPS and for `web-panel.reverse-proxy: true`. Only enable reverse-proxy mode when the public entry point really terminates HTTPS. The proxy must not be directly bypassable from untrusted networks.
-- On POSIX filesystems, `config.yml` is restricted to owner read/write (`0600`). ACME state directories use owner-only permissions (`0700`). On non-POSIX filesystems, configure equivalent ACLs in the host/container.
-- Request error logs record the URL path, not the full URI/query string, to reduce accidental leakage of query parameters.
-
-## Required deployment validation (not implied to have passed)
-
-1. Build with JDK 25: `mvn clean verify`.
-2. Use a dedicated test domain and `acme.staging: true`; confirm public DNS resolves to the host and TCP/80 reaches the panel's HTTP listener for `/.well-known/acme-challenge/<token>`.
-3. Confirm a staging certificate is not treated as a browser-trusted production certificate. Use a separate ACME state directory or remove the test state before switching to production issuance.
-4. Confirm renewal and listener reload with a test certificate, then test rollback by presenting an invalid certificate/key pair.
-5. Test reverse proxy mode with HTTPS at the proxy, HTTP only on a private upstream, `Secure` cookies, strict Origin checks, and no direct public upstream access.
-6. Exercise each API endpoint with OWNER, ADMINISTRATOR, VIEWER, READ-only API key and READ_WRITE API key. Confirm sensitive routes reject insufficient privileges.
-7. Test login throttling from repeated failures, TOTP failures, session rotation, individual revocation, global revocation and logout.
-8. Check filesystem permissions and logs after startup, failed login, ACME failure and a failed API request.
-
-ACME HTTP-01 requires public port 80 to be reachable from the certificate authority. The plugin cannot open host firewall rules or install Certbot in a restricted Pterodactyl container. In that environment, terminate HTTPS at a trusted reverse proxy and keep the plugin listener private.
+Static source checks and configuration parsing are performed for this archive, but a release build and live Certbot/Pterodactyl test still need to be run on the target host. The project targets Java 25.

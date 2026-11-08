@@ -70,7 +70,7 @@ public final class PanelConfig {
         Map<String,Object> web = section("web-panel");
         String mode = str(web, "mode", "HTTP").trim().toUpperCase(java.util.Locale.ROOT);
         web.put("mode", mode.equals("HTTPS") ? "HTTPS" : "HTTP");
-        root.remove("acme"); // ACME automation is not supported; use a reverse proxy or a keystore.
+        root.remove("acme"); // Legacy plugin-managed ACME settings are ignored; host Certbot is detected automatically.
     }
     public synchronized void save() throws IOException {
         DumperOptions options = new DumperOptions(); options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK); options.setPrettyFlow(true); options.setIndent(2);
