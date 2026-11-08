@@ -46,6 +46,7 @@ public final class CommandAliasService {
         try {
             reloadMeta = proxy.getCommandManager().metaBuilder("valiasreload").plugin(plugin).build();
             proxy.getCommandManager().register(reloadMeta, new SimpleCommand() {
+                @Override public boolean hasPermission(Invocation invocation) { return invocation.source().hasPermission("vertexvelocitywebpanel.aliases.reload"); }
                 @Override public void execute(Invocation invocation) {
                     if (!invocation.source().hasPermission("vertexvelocitywebpanel.aliases.reload")) {
                         invocation.source().sendMessage(net.kyori.adventure.text.Component.text("Missing permission: vertexvelocitywebpanel.aliases.reload"));
@@ -213,6 +214,14 @@ public final class CommandAliasService {
             this.playerOnly = playerOnly;
         }
 
+        /** Hide the alias from players who may not use it (tab completion / command list). */
+        @Override
+        public boolean hasPermission(Invocation invocation) {
+            CommandSource source = invocation.source();
+            if (!permission.isBlank() && !source.hasPermission(permission)) return false;
+            return !playerOnly || source instanceof Player;
+        }
+
         @Override
         public void execute(Invocation invocation) {
             CommandSource source = invocation.source();
@@ -236,6 +245,12 @@ public final class CommandAliasService {
                 expanded = expanded.replace("{arg" + (i + 1) + "}", args[i]);
             }
             expanded = expanded.replace("{args}", String.join(" ", args));
+            if (expanded.contains("{player}") || expanded.contains("{uuid}") || expanded.contains("{server}")) {
+                source.sendMessage(net.kyori.adventure.text.Component.text("This command can only be used by a player."));
+                return;
+            }
+            // Placeholders for arguments the sender did not provide are removed instead of being sent literally.
+            expanded = expanded.replaceAll("\\{(?:arg)?\\d+\\}", "").replaceAll("\\s{2,}", " ").trim();
             if (expanded.isBlank() || expanded.startsWith("/") || expanded.contains("\n") || expanded.contains("\r")) {
                 source.sendMessage(net.kyori.adventure.text.Component.text("This command alias is configured incorrectly."));
                 logger.warn("Blocked malformed command produced by an alias.");

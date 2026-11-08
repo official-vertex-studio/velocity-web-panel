@@ -26,7 +26,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Optional;
 
-@Plugin(id = "vertexvelocitywebpanel", name = "Vertex Velocity Web Panel", version = "5.3.0", description = "Premium live administration panel for Velocity", authors = {"Vertex Studio"})
+@Plugin(id = "vertexvelocitywebpanel", name = "Vertex Velocity Web Panel", version = "5.4.0", description = "Premium live administration panel for Velocity", authors = {"Vertex Studio"})
 public final class VertexVelocityWebPanel {
     private final ProxyServer proxy;
     private final Logger logger;
@@ -38,6 +38,7 @@ public final class VertexVelocityWebPanel {
     private MaintenanceService maintenance;
     private MotdService motd;
     private CommandAliasService aliases;
+    private ProxyCommands commands;
 
     @Inject
     public VertexVelocityWebPanel(ProxyServer proxy, Logger logger, @com.velocitypowered.api.plugin.annotation.DataDirectory Path dataDirectory) {
@@ -56,13 +57,15 @@ public final class VertexVelocityWebPanel {
             this.startedAt = Instant.now();
             this.maintenance = new MaintenanceService(dataDirectory);
             this.motd = new MotdService(dataDirectory);
-            new ProxyCommands(proxy, startedAt, database).register(this);
-            logger.info("Registered proxy-wide commands: /vstats, /vservers, /vplayers, /vserver, /vping, /vhelp");
+            this.commands = new ProxyCommands(proxy, startedAt, database);
+            commands.register(this);
+            logger.info("Registered proxy-wide commands: /vstats, /vpanel, /vservers, /vplayers, /vserver, /vping, /vhelp");
             this.aliases = new CommandAliasService(proxy, logger, this, dataDirectory);
             int aliasCount = aliases.loadAndRegister();
             logger.info("Registered {} custom command alias(es) from aliases.yml", aliasCount);
             this.webPanel = new WebPanelServer(proxy, logger, config, database, startedAt, dataDirectory, maintenance, motd, aliases);
             webPanel.setPluginOwner(this);
+            commands.setPanelActive(webPanel::isRunning);
             webPanel.start();
             webPanel.notifyProxyStarted();
             logger.info("Vertex Velocity Web Panel initialized. Panel mode: {}", config.webMode());

@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
 import java.time.Instant;
 import fr.vertexvelocity.webpanel.db.PanelDatabase;
 import java.sql.SQLException;
@@ -23,6 +24,7 @@ public final class ProxyCommands {
     private final ProxyServer proxy;
     private final Instant startedAt;
     private final PanelDatabase database;
+    private volatile BooleanSupplier panelActive = () -> false;
 
     public ProxyCommands(ProxyServer proxy, Instant startedAt, PanelDatabase database) {
         this.proxy = proxy;
@@ -30,36 +32,71 @@ public final class ProxyCommands {
         this.database = database;
     }
 
+    /** Lets /vpanel report the real state of the web listener instead of a hard-coded value. */
+    public void setPanelActive(BooleanSupplier supplier) { this.panelActive = supplier == null ? () -> false : supplier; }
+
     public void register(Object plugin) {
-        register(plugin, "vstats", new String[]{"vertexstats"}, this::stats);
-        register(plugin, "vpanel", new String[]{"vertexpanel"}, this::panel);
-        register(plugin, "vservers", new String[]{"vertexservers"}, this::servers);
-        register(plugin, "vplayers", new String[]{"vertexplayers"}, this::players);
-        register(plugin, "vserver", new String[]{"vertexserver"}, this::server);
-        register(plugin, "vping", new String[]{"vertexping"}, this::ping);
-        register(plugin, "vhelp", new String[]{"vertexhelp"}, this::help);
+        register(plugin, "vstats", new String[]{"vertexstats"}, null, this::stats);
+        register(plugin, "vpanel", new String[]{"vertexpanel"}, null, this::panel);
+        register(plugin, "vservers", new String[]{"vertexservers"}, null, this::servers);
+        register(plugin, "vplayers", new String[]{"vertexplayers"}, PERM_PLAYERS, this::players);
+        register(plugin, "vserver", new String[]{"vertexserver"}, null, this::server);
+        register(plugin, "vping", new String[]{"vertexping"}, null, this::ping);
+        register(plugin, "vhelp", new String[]{"vertexhelp"}, null, this::help);
     }
 
-    private void register(Object plugin, String name, String[] aliases, Handler handler) {
+    private static final String PERM_PLAYERS = "vertexvelocity.command.players";
+    private static final String PERM_SERVER = "vertexvelocity.command.server";
+    private static final String PERM_PLAYERSTATS = "vertexvelocity.command.playerstats";
+
+    /** @param permission when non-null the command is hidden from (and not executable by) sources lacking it. */
+    private void register(Object plugin, String name, String[] aliases, String permission, Handler handler) {
         CommandMeta meta = proxy.getCommandManager().metaBuilder(name).aliases(aliases).plugin(plugin).build();
         proxy.getCommandManager().register(meta, new SimpleCommand() {
             @Override public void execute(Invocation invocation) { handler.run(invocation); }
-            @Override public List<String> suggest(Invocation invocation) {
-                if (name.equals("vplayers")) {
-                    String prefix = invocation.arguments().length == 0 ? "" : invocation.arguments()[invocation.arguments().length - 1].toLowerCase(Locale.ROOT);
-                    return proxy.getAllServers().stream().map(server -> server.getServerInfo().getName()).filter(n -> n.toLowerCase(Locale.ROOT).startsWith(prefix)).sorted().limit(50).toList();
-                }
-                if (name.equals("vserver")) {
-                    String prefix = invocation.arguments().length == 0 ? "" : invocation.arguments()[invocation.arguments().length - 1].toLowerCase(Locale.ROOT);
-                    return proxy.getAllPlayers().stream().map(Player::getUsername).filter(n -> n.toLowerCase(Locale.ROOT).startsWith(prefix)).sorted().limit(50).toList();
-                }
-                return List.of();
-            }
+            @Override public boolean hasPermission(Invocation invocation) { return permission == null || invocation.source().hasPermission(permission); }
+            @Override public List<String> suggest(Invocation invocation) { return suggestFor(name, invocation); }
         });
+    }
+
+    private List<String> suggestFor(String name, SimpleCommand.Invocation invocation) {
+        String[] args = invocation.arguments();
+        int index = Math.max(0, args.length - 1);
+        String prefix = args.length == 0 ? "" : args[index].toLowerCase(Locale.ROOT);
+        CommandSource source = invocation.source();
+        return switch (name) {
+            case "vplayers" -> index == 0 ? backendNames(prefix) : List.of();
+            case "vserver" -> index == 0 && source.hasPermission(PERM_SERVER) ? playerNames(prefix) : List.of();
+            case "vstats" -> {
+                if (index == 0) yield filter(List.of("serveur", "joueur"), prefix);
+                if (index == 1) {
+                    String sub = args[0].toLowerCase(Locale.ROOT);
+                    if (sub.equals("serveur") || sub.equals("server")) yield backendNames(prefix);
+                    if (sub.equals("joueur") || sub.equals("player")) yield playerNames(prefix);
+                }
+                yield List.of();
+            }
+            default -> List.of();
+        };
+    }
+    private List<String> backendNames(String prefix) { return filter(proxy.getAllServers().stream().map(sv -> sv.getServerInfo().getName()).toList(), prefix); }
+    private List<String> playerNames(String prefix) { return filter(proxy.getAllPlayers().stream().map(Player::getUsername).toList(), prefix); }
+    private static List<String> filter(List<String> values, String prefix) {
+        return values.stream().filter(v -> v.toLowerCase(Locale.ROOT).startsWith(prefix)).sorted(String.CASE_INSENSITIVE_ORDER).limit(50).toList();
     }
 
     private void stats(SimpleCommand.Invocation inv) {
         CommandSource s = inv.source();
+        String[] args = inv.arguments();
+        if (args.length > 0) {
+            String sub = args[0].toLowerCase(Locale.ROOT);
+            boolean backend = sub.equals("serveur") || sub.equals("server");
+            boolean player = sub.equals("joueur") || sub.equals("player");
+            if (!backend && !player) { line(s, "Usage: /vstats [serveur <backend> | joueur <player>]", NamedTextColor.YELLOW); return; }
+            if (args.length < 2) { line(s, "Usage: /vstats " + sub + (backend ? " <backend>" : " <player>"), NamedTextColor.YELLOW); return; }
+            if (backend) serverStats(s, args[1]); else playerStats(s, args[1]);
+            return;
+        }
         long totalPing = proxy.getAllPlayers().stream().mapToLong(Player::getPing).sum();
         long avgPing = proxy.getPlayerCount() == 0 ? 0 : totalPing / proxy.getPlayerCount();
         line(s, "VERTEX VELOCITY  /  NETWORK STATUS", NamedTextColor.LIGHT_PURPLE);
@@ -77,7 +114,7 @@ public final class ProxyCommands {
         }
         line(s, "Backends with players: " + onlineBackends, NamedTextColor.GRAY);
         try { Map<String,Object> history=database.analyticsSummary(1);line(s,"Last 24h · Peak: "+history.getOrDefault("peakPlayers",0)+" · Average: "+history.getOrDefault("averagePlayers",0)+" · Connections: "+history.getOrDefault("connections",0),NamedTextColor.AQUA); } catch(Exception ignored) {}
-        line(s, "Use /vservers, /vplayers or /vhelp", NamedTextColor.DARK_GRAY);
+        line(s, "Use /vservers, /vplayers, /vstats serveur <name>, /vstats joueur <name> or /vhelp", NamedTextColor.DARK_GRAY);
     }
 
     private void serverStats(CommandSource s,String name){
@@ -99,7 +136,7 @@ public final class ProxyCommands {
             try{Map<String,Object> profile=database.playerProfile(p.getUniqueId().toString(),20);line(s,"Recorded playtime: "+duration(((Number)profile.getOrDefault("totalPlaySeconds",0L)).longValue()),NamedTextColor.GRAY);line(s,"Recorded sessions: "+profile.getOrDefault("sessionCount",0),NamedTextColor.GRAY);}catch(Exception e){line(s,"Historical profile unavailable.",NamedTextColor.YELLOW);}
             return;
         }
-        if(!s.hasPermission("vertexvelocity.command.playerstats")){line(s,"You do not have permission: vertexvelocity.command.playerstats",NamedTextColor.RED);return;}
+        if(!s.hasPermission(PERM_PLAYERSTATS)){line(s,"You do not have permission: "+PERM_PLAYERSTATS,NamedTextColor.RED);return;}
         try {
             Optional<Map<String,Object>> found=database.playerProfileByName(name,30);
             if(found.isPresent()){Map<String,Object> profile=found.get();line(s,"PLAYER HISTORY · "+profile.get("username"),NamedTextColor.LIGHT_PURPLE);line(s,"Total playtime: "+duration(((Number)profile.getOrDefault("totalPlaySeconds",0L)).longValue()),NamedTextColor.GREEN);line(s,"Recorded sessions: "+profile.getOrDefault("sessionCount",0)+" · Transfers: "+profile.getOrDefault("transferCount",0),NamedTextColor.GRAY);line(s,"Last seen: "+Instant.ofEpochSecond(((Number)profile.getOrDefault("lastSeen",0L)).longValue()),NamedTextColor.GRAY);return;}
@@ -110,7 +147,7 @@ public final class ProxyCommands {
         CommandSource s=inv.source();long uptime=Math.max(0,Instant.now().getEpochSecond()-startedAt.getEpochSecond());
         line(s,"VERTEX PANEL STATUS",NamedTextColor.LIGHT_PURPLE);
         line(s,"Proxy: ONLINE · Players: "+proxy.getPlayerCount(),NamedTextColor.GREEN);
-        line(s,"Web panel process: ACTIVE",NamedTextColor.GREEN);
+        boolean active=panelActive.getAsBoolean();line(s,"Web panel: "+(active?"ACTIVE":"NOT RUNNING"),active?NamedTextColor.GREEN:NamedTextColor.RED);
         line(s,"Uptime: "+duration(uptime)+" · Backends: "+proxy.getAllServers().size(),NamedTextColor.GRAY);
     }
 
@@ -128,7 +165,7 @@ public final class ProxyCommands {
 
     private void players(SimpleCommand.Invocation inv) {
         CommandSource s = inv.source();
-        if (!s.hasPermission("vertexvelocity.command.players")) { line(s, "You do not have permission: vertexvelocity.command.players", NamedTextColor.RED); return; }
+        if (!s.hasPermission(PERM_PLAYERS)) { line(s, "You do not have permission: "+PERM_PLAYERS, NamedTextColor.RED); return; }
         String filter = inv.arguments().length > 0 ? inv.arguments()[0].toLowerCase(Locale.ROOT) : "";
         List<Player> matches = proxy.getAllPlayers().stream()
                 .filter(p -> filter.isEmpty() || p.getCurrentServer().map(c -> c.getServerInfo().getName().equalsIgnoreCase(filter)).orElse(false))
@@ -150,7 +187,7 @@ public final class ProxyCommands {
             } else line(s, "Usage: /vserver <player>", NamedTextColor.YELLOW);
             return;
         }
-        if (!s.hasPermission("vertexvelocity.command.server")) { line(s, "You do not have permission: vertexvelocity.command.server", NamedTextColor.RED); return; }
+        if (!s.hasPermission(PERM_SERVER)) { line(s, "You do not have permission: "+PERM_SERVER, NamedTextColor.RED); return; }
         Optional<Player> target = proxy.getPlayer(inv.arguments()[0]);
         if (target.isEmpty()) { line(s, "That player is not connected to this proxy.", NamedTextColor.RED); return; }
         Player p = target.get();
@@ -171,9 +208,10 @@ public final class ProxyCommands {
         line(s, "/vstats joueur <name> - Player activity and playtime", NamedTextColor.GRAY);
         line(s, "/vpanel - Web panel and proxy status", NamedTextColor.GRAY);
         line(s, "/vservers - Backends and connected player counts", NamedTextColor.GRAY);
-        line(s, "/vplayers [backend] - Online player list (permission required)", NamedTextColor.GRAY);
-        line(s, "/vserver [player] - Your backend or another player's backend", NamedTextColor.GRAY);
+        if (s.hasPermission(PERM_PLAYERS)) line(s, "/vplayers [backend] - Online player list", NamedTextColor.GRAY);
+        line(s, s.hasPermission(PERM_SERVER) ? "/vserver [player] - Your backend or another player's backend" : "/vserver - Your current backend", NamedTextColor.GRAY);
         line(s, "/vping - Your current proxy ping", NamedTextColor.GRAY);
+        line(s, "Every command also works as /vertex<name>, e.g. /vertexstats", NamedTextColor.DARK_GRAY);
     }
 
     private static String duration(long seconds) {
