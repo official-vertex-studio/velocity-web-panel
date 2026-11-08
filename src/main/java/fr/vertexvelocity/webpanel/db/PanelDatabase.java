@@ -25,6 +25,7 @@ public final class PanelDatabase implements AutoCloseable {
             s.execute("PRAGMA journal_mode=WAL"); s.execute("PRAGMA foreign_keys=ON");
             s.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, salt TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL, created_at INTEGER NOT NULL, disabled INTEGER NOT NULL DEFAULT 0)");
             s.execute("CREATE TABLE IF NOT EXISTS user_totp(username TEXT PRIMARY KEY, secret TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)");
+            s.execute("CREATE TABLE IF NOT EXISTS user_totp_pending(username TEXT PRIMARY KEY, secret TEXT NOT NULL, created_at INTEGER NOT NULL, FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE)");
             s.execute("CREATE TABLE IF NOT EXISTS user_totp_recovery(username TEXT NOT NULL, code_hash TEXT NOT NULL, used_at INTEGER, PRIMARY KEY(username,code_hash), FOREIGN KEY(username) REFERENCES user_totp(username) ON DELETE CASCADE)");
             s.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)");
             s.execute("CREATE TABLE IF NOT EXISTS invitations(token_hash TEXT PRIMARY KEY, role TEXT NOT NULL, created_by TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER)");
@@ -69,17 +70,22 @@ public final class PanelDatabase implements AutoCloseable {
     public synchronized String totpSecret(String username) throws SQLException {
         try(PreparedStatement p=connection.prepareStatement("SELECT secret FROM user_totp WHERE username=? AND enabled=1")){p.setString(1,username);try(ResultSet r=p.executeQuery()){return r.next()?r.getString(1):null;}}
     }
-    public synchronized String pendingTotpSecret(String username) throws SQLException {try(PreparedStatement p=connection.prepareStatement("SELECT secret FROM user_totp WHERE username=? AND enabled=0")){p.setString(1,username);try(ResultSet r=p.executeQuery()){return r.next()?r.getString(1):null;}}}
+    public synchronized String pendingTotpSecret(String username) throws SQLException {try(PreparedStatement p=connection.prepareStatement("SELECT secret FROM user_totp_pending WHERE username=?")){p.setString(1,username);try(ResultSet r=p.executeQuery()){return r.next()?r.getString(1):null;}}}
     public synchronized boolean totpEnabled(String username) throws SQLException {
         try(PreparedStatement p=connection.prepareStatement("SELECT enabled FROM user_totp WHERE username=?")){p.setString(1,username);try(ResultSet r=p.executeQuery()){return r.next()&&r.getInt(1)==1;}}
     }
     public synchronized String createPendingTotp(String username,String secret) throws SQLException {
-        try(PreparedStatement p=connection.prepareStatement("INSERT INTO user_totp(username,secret,enabled,updated_at) VALUES(?,?,0,?) ON CONFLICT(username) DO UPDATE SET secret=excluded.secret,enabled=0,updated_at=excluded.updated_at")){p.setString(1,username);p.setString(2,secret);p.setLong(3,Instant.now().getEpochSecond());p.executeUpdate();} return secret;
+        // Keep the currently active secret untouched until the replacement is verified.
+        try(PreparedStatement p=connection.prepareStatement("INSERT INTO user_totp_pending(username,secret,created_at) VALUES(?,?,?) ON CONFLICT(username) DO UPDATE SET secret=excluded.secret,created_at=excluded.created_at")){p.setString(1,username);p.setString(2,secret);p.setLong(3,Instant.now().getEpochSecond());p.executeUpdate();} return secret;
     }
     public synchronized void enableTotp(String username, List<String> recoveryCodeHashes) throws SQLException {
         connection.setAutoCommit(false);
         try {
-            try(PreparedStatement p=connection.prepareStatement("UPDATE user_totp SET enabled=1,updated_at=? WHERE username=?")){p.setLong(1,Instant.now().getEpochSecond());p.setString(2,username);if(p.executeUpdate()!=1)throw new SQLException("TOTP setup was not found");}
+            String pendingSecret;
+            try(PreparedStatement p=connection.prepareStatement("SELECT secret FROM user_totp_pending WHERE username=?")){p.setString(1,username);try(ResultSet r=p.executeQuery()){if(!r.next())throw new SQLException("TOTP setup was not found");pendingSecret=r.getString(1);}}
+            long now=Instant.now().getEpochSecond();
+            try(PreparedStatement p=connection.prepareStatement("INSERT INTO user_totp(username,secret,enabled,updated_at) VALUES(?,?,1,?) ON CONFLICT(username) DO UPDATE SET secret=excluded.secret,enabled=1,updated_at=excluded.updated_at")){p.setString(1,username);p.setString(2,pendingSecret);p.setLong(3,now);p.executeUpdate();}
+            try(PreparedStatement d=connection.prepareStatement("DELETE FROM user_totp_pending WHERE username=?")){d.setString(1,username);d.executeUpdate();}
             try(PreparedStatement d=connection.prepareStatement("DELETE FROM user_totp_recovery WHERE username=?")){d.setString(1,username);d.executeUpdate();}
             try(PreparedStatement p=connection.prepareStatement("INSERT INTO user_totp_recovery(username,code_hash) VALUES(?,?)")){for(String hash:recoveryCodeHashes){p.setString(1,username);p.setString(2,hash);p.addBatch();}p.executeBatch();}
             connection.commit();
@@ -92,6 +98,7 @@ public final class PanelDatabase implements AutoCloseable {
         }
     }
     public synchronized void disableTotp(String username) throws SQLException {
+        try(PreparedStatement p=connection.prepareStatement("DELETE FROM user_totp_pending WHERE username=?")){p.setString(1,username);p.executeUpdate();}
         try(PreparedStatement p=connection.prepareStatement("DELETE FROM user_totp_recovery WHERE username=?")){p.setString(1,username);p.executeUpdate();}
         try(PreparedStatement p=connection.prepareStatement("DELETE FROM user_totp WHERE username=?")){p.setString(1,username);p.executeUpdate();}
     }
