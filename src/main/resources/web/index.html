@@ -210,7 +210,7 @@
               <form id="listener-form" class="auth-form settings-form" style="margin-top:0">
                 <div class="form-grid settings-fields">
                   <label>Panel status<select name="webEnabled"><option value="true">Enabled</option><option value="false">Disabled</option></select></label>
-                  <label>Protocol<input value="HTTP only" disabled></label>
+                  <label>Protocol<input name="protocolDisplay" value="HTTP" disabled title="Set web-panel.mode / reverse-proxy in config.yml"></label>
                   <label>Bind address<input name="bindAddress" required placeholder="127.0.0.1" autocomplete="off"></label>
                   <label>HTTP port<input name="httpPort" type="number" min="1024" max="65535" required></label>
                   
@@ -411,7 +411,7 @@ function settingsTab(name){
   });
 }
 function panelHostForUrl(){let host=window.location.hostname||'127.0.0.1';if(host.includes(':')&&!host.startsWith('['))host='['+host+']';return host;}
-function renderPanelAccess(w,preview=false){const box=$('#panel-access-urls'),caption=$('#panel-access-caption'),badge=$('#panel-protocol-status');if(!box||!caption||!badge)return;const enabled=preview?($('#listener-form')?.elements.webEnabled?.value!=='false'):w.enabled!==false;const port=Number($('#listener-form')?.elements.httpPort?.value||w['http-port']||25569);badge.textContent='HTTP ONLY';badge.className='tag tag-http';caption.textContent=preview?'HTTP address after restart.':'Active local HTTP address.';if(!enabled){box.innerHTML='<div class="notice error">The web panel is disabled in config.yml.</div>';return;}const url='http://'+panelHostForUrl()+':'+port+'/';box.innerHTML=`<div class="access-link-row"><div class="access-link-main"><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a><small>Unencrypted HTTP listener</small></div><div class="access-link-actions"><button type="button" data-copy-panel-url="${esc(url)}">Copy URL</button><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open ↗</a></div></div>`;box.querySelector('[data-copy-panel-url]')?.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(url)}catch{window.prompt('Copy panel URL:',url)}});}
+function renderPanelAccess(w,preview=false){const box=$('#panel-access-urls'),caption=$('#panel-access-caption'),badge=$('#panel-protocol-status');if(!box||!caption||!badge)return;const enabled=preview?($('#listener-form')?.elements.webEnabled?.value!=='false'):w.enabled!==false;const port=Number($('#listener-form')?.elements.httpPort?.value||w['http-port']||25569);const secure=(w.mode==='HTTPS'||w['reverse-proxy']===true||window.location.protocol==='https:');badge.textContent=w.mode==='HTTPS'?'HTTPS':(secure?'HTTPS (PROXY)':'HTTP');badge.className='tag tag-http';caption.textContent=preview?'Address after restart.':'Active local address.';if(!enabled){box.innerHTML='<div class="notice error">The web panel is disabled in config.yml.</div>';return;}const url=(w.mode==='HTTPS'?'https://':'http://')+panelHostForUrl()+':'+port+'/';box.innerHTML=`<div class="access-link-row"><div class="access-link-main"><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a><small>${w.mode==='HTTPS'?'TLS listener (keystore)':(w['reverse-proxy']===true?'Plain HTTP upstream — HTTPS is terminated by your reverse proxy':'Unencrypted HTTP listener')}</small></div><div class="access-link-actions"><button type="button" data-copy-panel-url="${esc(url)}">Copy URL</button><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">Open ↗</a></div></div>`;box.querySelector('[data-copy-panel-url]')?.addEventListener('click',async()=>{try{await navigator.clipboard.writeText(url)}catch{window.prompt('Copy panel URL:',url)}});}
 function refreshPanelAccessPreview(){if(loadedPanelConfig)renderPanelAccess(loadedPanelConfig['web-panel']||{},true);}
 async function loadConfig(){
   let config;
@@ -421,7 +421,7 @@ async function loadConfig(){
     const form=$('#listener-form');
     if(form){
       form.elements.webEnabled.value=String(w.enabled!==false);
-      if(form.elements.mode)form.elements.mode.value='HTTP';
+      if(form.elements.protocolDisplay)form.elements.protocolDisplay.value=((config['web-panel']||{}).mode||'HTTP');
       form.elements.bindAddress.value=w['bind-address']||'127.0.0.1';
       form.elements.httpPort.value=w['http-port']||25569;
       
@@ -449,7 +449,7 @@ async function loadConfig(){
   renderPanelAccess(config['web-panel']||{},false);
   const w=config['web-panel']||{},sec=config.security||{},stats=config.statistics||{};
   $('#config-view').innerHTML=
-    `<div class="notice-row"><span>Running protocol</span><strong>HTTP</strong></div>`+
+    `<div class="notice-row"><span>Running protocol</span><strong>${esc(w.mode||'HTTP')}${w['reverse-proxy']===true?' (behind HTTPS proxy)':''}</strong></div>`+
     `<div class="notice-row"><span>Bind address</span><strong>${esc(w['bind-address']||'—')}</strong></div>`+
     `<div class="notice-row"><span>HTTP port</span><strong>${esc(w['http-port']||25569)}</strong></div>`+
     `<div class="notice-row"><span>Data retention</span><strong>${esc(stats['retention-days']||30)} days</strong></div>`+
@@ -490,7 +490,7 @@ async function loadSecurity(){
   try{
     const c=await api('/config'),sec=c.security||{};
     $('#security-policy').innerHTML=
-      `<div class="notice-row"><span>Panel protocol</span><strong>HTTP only</strong></div>`+
+      `<div class="notice-row"><span>Panel protocol</span><strong>${esc((c['web-panel']||{}).mode||'HTTP')}${(c['web-panel']||{})['reverse-proxy']===true?' + HTTPS reverse proxy':''}</strong></div>`+
       `<div class=\"notice-row\"><span>Session lifetime</span><strong>${esc(sec['session-minutes']||60)} minutes</strong></div>`+
       `<div class=\"notice-row\"><span>Login attempts limit</span><strong>${esc(sec['login-attempts-per-minute']||8)} / minute / IP</strong></div>`+
       `<div class=\"notice-row\"><span>Trusted proxy headers</span><strong>${sec['trust-proxy-headers']?'Enabled':'Disabled'}</strong></div>`;

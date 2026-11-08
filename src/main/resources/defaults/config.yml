@@ -1,13 +1,29 @@
-# Vertex Velocity Web Panel — HTTP-only configuration
+# Vertex Velocity Web Panel configuration
 web-panel:
   enabled: true
+  # HTTP  = plain listener (use it behind Nginx/Caddy/etc. that terminates HTTPS)
+  # HTTPS = the panel terminates TLS itself using the keystore below
   mode: HTTP
   bind-address: 127.0.0.1
   http-port: 25569
+  # Set to true when a reverse proxy serves the panel over HTTPS (cookies get "Secure", CSRF expects https://)
+  reverse-proxy: false
+  # Only used when mode: HTTPS (path relative to the plugin data folder, or absolute)
+  https:
+    keystore: tls/keystore.p12
+    keystore-type: PKCS12
+    keystore-password: ''
 security:
   session-minutes: 60
   login-attempts-per-minute: 8
+  invitation-attempts-per-minute: 5
+  # Read X-Forwarded-For / X-Forwarded-Proto / X-Forwarded-Host, but ONLY from the proxies listed below.
   trust-proxy-headers: false
+  trusted-proxies:
+    - 127.0.0.1
+    - '::1'
+  # Optional extra allowed Origins for CSRF checks, e.g. https://panel.example.com
+  allowed-origins: []
 statistics:
   sample-seconds: 15
   retention-days: 30

@@ -68,11 +68,9 @@ public final class PanelConfig {
     }
     private synchronized void removeLegacyTransportConfig() {
         Map<String,Object> web = section("web-panel");
-        web.remove("https");
-        web.remove("https-port");
-        web.remove("reverse-proxy");
-        web.put("mode", "HTTP");
-        root.remove("acme");
+        String mode = str(web, "mode", "HTTP").trim().toUpperCase(java.util.Locale.ROOT);
+        web.put("mode", mode.equals("HTTPS") ? "HTTPS" : "HTTP");
+        root.remove("acme"); // ACME automation is not supported; use a reverse proxy or a keystore.
     }
     public synchronized void save() throws IOException {
         DumperOptions options = new DumperOptions(); options.setDefaultFlowStyle(DumperOptions.FlowStyle.BLOCK); options.setPrettyFlow(true); options.setIndent(2);
@@ -83,7 +81,17 @@ public final class PanelConfig {
         try { Files.setPosixFilePermissions(target, Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE)); }
         catch (UnsupportedOperationException | IOException ignored) { /* Non-POSIX filesystem: retain platform ACLs. */ }
     }
-    public synchronized String webMode() { return "HTTP"; }
+    /** "HTTPS" when the panel terminates TLS itself, otherwise "HTTP" (plain listener, optionally behind a TLS reverse proxy). */
+    public synchronized String webMode() { return "HTTPS".equalsIgnoreCase(str(section("web-panel"), "mode", "HTTP").trim()) ? "HTTPS" : "HTTP"; }
+    /** True when a trusted reverse proxy terminates HTTPS in front of the panel: cookies get Secure, CSRF expects https. */
+    public synchronized boolean reverseProxy() { return bool(section("web-panel"), "reverse-proxy", false); }
+    public synchronized String httpsKeystore() { return str(child(section("web-panel"), "https"), "keystore", "tls/keystore.p12"); }
+    public synchronized String httpsKeystoreType() { return str(child(section("web-panel"), "https"), "keystore-type", "PKCS12"); }
+    public synchronized String httpsKeystorePassword() { return str(child(section("web-panel"), "https"), "keystore-password", ""); }
+    public synchronized boolean trustProxyHeaders() { return bool(section("security"), "trust-proxy-headers", false); }
+    public synchronized java.util.List<String> trustedProxies() { return stringList(section("security"), "trusted-proxies", java.util.List.of("127.0.0.1", "::1")); }
+    public synchronized java.util.List<String> allowedOrigins() { return stringList(section("security"), "allowed-origins", java.util.List.of()); }
+    public synchronized int invitationAttemptsPerMinute() { return Math.max(1, Math.min(60, integer(section("security"), "invitation-attempts-per-minute", 5))); }
     public synchronized boolean webEnabled() { return bool(section("web-panel"), "enabled", true); }
     public synchronized String bindAddress() { return str(section("web-panel"), "bind-address", "127.0.0.1"); }
     public synchronized int httpPort() { return integer(section("web-panel"), "http-port", 25569); }
@@ -110,7 +118,6 @@ public final class PanelConfig {
         Map<String,Object> security = section("security");
         Map<String,Object> stats = section("statistics");
         Map<String,Object> monitoring = section("monitoring");
-        web.put("mode", "HTTP");
         if (values.containsKey("bindAddress")) {
             String address = String.valueOf(values.get("bindAddress")).trim();
             if (address.isBlank() || address.length() > 255 || address.contains(" ")) throw new IllegalArgumentException("Bind address is invalid");
@@ -125,9 +132,6 @@ public final class PanelConfig {
         putBounded(values, "highLatencyMs", monitoring, "high-latency-ms", 100, 60000);
         putBounded(values, "alertCooldownSeconds", monitoring, "alert-cooldown-seconds", 30, 86400);
         putBounded(values, "alertHistoryLimit", monitoring, "alert-history-limit", 100, 10000);
-        web.remove("https");
-        root.remove("acme");
-        web.put("mode", "HTTP");
         save();
     }
 
@@ -151,8 +155,9 @@ public final class PanelConfig {
     public synchronized Map<String,Object> publicView() {
         Map<String,Object> result = new LinkedHashMap<>();
         Map<String,Object> web = new LinkedHashMap<>(section("web-panel"));
-        web.remove("https");
-        web.put("mode", "HTTP");
+        web.remove("https"); // keystore path/password stay private
+        web.put("mode", webMode());
+        web.put("reverse-proxy", reverseProxy());
         result.put("web-panel", web);
         result.put("statistics", new LinkedHashMap<>(section("statistics"))); result.put("security", new LinkedHashMap<>(section("security")));
         result.put("monitoring", new LinkedHashMap<>(section("monitoring")));
@@ -163,5 +168,12 @@ public final class PanelConfig {
     private static Map<String,Object> stringMap(Map<?,?> m) { Map<String,Object> out=new LinkedHashMap<>(); m.forEach((k,v)->out.put(String.valueOf(k),v)); return out; }
     private static String str(Map<String,Object> m,String k,String d) { Object v=m.get(k); return v == null ? d : String.valueOf(v); }
     private static int integer(Map<String,Object> m,String k,int d) { Object v=m.get(k); try { return v == null ? d : Integer.parseInt(String.valueOf(v)); } catch (RuntimeException e) { return d; } }
+    private static java.util.List<String> stringList(Map<String,Object> m, String k, java.util.List<String> d) {
+        Object v = m.get(k);
+        if (!(v instanceof Iterable<?> it)) return d;
+        java.util.List<String> out = new java.util.ArrayList<>();
+        for (Object o : it) { String t = String.valueOf(o).trim(); if (!t.isEmpty()) out.add(t); }
+        return out;
+    }
     private static boolean bool(Map<String,Object> m,String k,boolean d) { Object v=m.get(k); return v == null ? d : Boolean.parseBoolean(String.valueOf(v)); }
 }
